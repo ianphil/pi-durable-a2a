@@ -186,7 +186,7 @@ test('storage loss during cancellation resumes cleanup and stays canceled', { ti
 });
 
 const LegacyAdmission = defineDoc({ kind: 'a2a.admission', version: 1, scope: 'conversation',
-  history: 'latest', fork: 'initial', initial: () => ({ count: 10_000 }), checkpointWhen: () => true });
+  history: 'latest', fork: 'initial', initial: () => ({}), checkpointWhen: () => true });
 
 test('an old lifetime counter does not block admission after reopen', async () => {
   await directory(async (path) => {
@@ -196,6 +196,8 @@ test('an old lifetime counter does not block admission after reopen', async () =
       await running.conversation.commit(async (tx) => { (await tx.doc(LegacyAdmission, running.conversation.id)).count = 10_000; }, context);
       await running.close();
       running = await host(await openNodeSqliteStorage(path), faux);
+      const persisted = await running.harness.snapshot(LegacyAdmission, running.conversation.id, context);
+      assert.equal(persisted?.count, 10_000, 'the old counter must be stored, not supplied by the fixture default');
       faux.setResponses([fauxAssistantMessage('Accepted beyond the old cap')]);
       const task = await running.a2a.handler.sendMessage(message('beyond-cap'), call());
       assert.equal(task.status.state, TaskState.TASK_STATE_COMPLETED);
@@ -268,6 +270,12 @@ test('reads refuse future task versions without rewriting stored records', async
       const before = await running.harness.getTask(id, context);
       await assert.rejects(running.a2a.handler.getTask(GetTaskRequest.fromJSON({ id: String(id) }), call()), /Unsupported stored/);
       await assert.rejects(running.a2a.handler.listTasks(ListTasksRequest.fromJSON({}), call()), /Unsupported stored/);
+      // This pending future-version task would be excluded by each filter. Its
+      // version must still be checked before reading state or timestamp fields.
+      for (const filter of [
+        { status: 'TASK_STATE_COMPLETED' },
+        { statusTimestampAfter: '9999-01-01T00:00:00.000Z' },
+      ]) await assert.rejects(running.a2a.handler.listTasks(ListTasksRequest.fromJSON(filter), call()), /Unsupported stored/);
       await assert.rejects(running.a2a.handler.sendMessage(message('future'), call()), /Unsupported stored/);
       assert.deepEqual(await running.harness.getTask(id, context), before);
     } finally { await running.close(); }

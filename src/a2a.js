@@ -95,8 +95,12 @@ function recordState(record) {
 }
 const recordTimestamp = (record) => record.endedAt ?? record.startedAt ?? record.input.acceptedAt;
 
-export function taskView(record) {
+function checkTaskVersion(record) {
   if (record.version !== 1) throw new UnsupportedOperationError('Unsupported stored A2A task version');
+}
+
+export function taskView(record) {
+  checkTaskVersion(record);
   const contextId = String(record.conversationId);
   const state = recordState(record);
   let text;
@@ -149,7 +153,10 @@ export function durableTaskStore(harness, conversation) {
         let countCursor;
         do {
           const page = await tx.scanTasks(query, 100, countCursor);
-          totalSize += filtered ? page.items.filter(matches).length : page.items.length;
+          for (const record of page.items) {
+            checkTaskVersion(record);
+            if (!filtered || matches(record)) totalSize += 1;
+          }
           countCursor = page.next;
         } while (countCursor);
         if (totalSize === 0) return { tasks: [], nextPageToken: '', pageSize: params.pageSize, totalSize };
