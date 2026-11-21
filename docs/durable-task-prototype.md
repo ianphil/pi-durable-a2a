@@ -69,7 +69,9 @@ open and resume the harness. There is no A2A recovery scan or execution loop.
   and unexpected task-fault details are not exposed.
 - `ResultManager` can perform its transient load/merge/save operations against
   the view. The executor publishes only snapshots derived from committed tasks;
-  it waits for Durable, rather than owning execution.
+  it waits for Durable, rather than owning execution. Duplicate sends reuse that
+  task without resubmitting: blocking retries wait for settlement, immediate
+  retries return the current view, and both honor SDK history-length semantics.
 - The SDK's default cancellation implementation skips the executor when there
   is no event bus. After reopening this would only attempt to save a canceled
   snapshot, leaving the run untouched. The prototype handler explicitly invokes
@@ -78,13 +80,18 @@ open and resume the harness. There is no A2A recovery scan or execution loop.
 - The SDK interprets an injected task ID as continuation and refuses a terminal
   task. A new Durable task may finish before SDK request-context creation, so the
   prototype uses the SDK's ordinary new-message validation, then binds its
-  `RequestContext` to the already admitted task. It also tracks SDK event drains
-  during shutdown so those transient readers finish before the host closes
-  Durable. These are SDK integration points, not persistent state.
+  `RequestContext` to the already admitted task. Shutdown tracks sends from entry
+  through response, including the gap between admission and executor startup,
+  then joins SDK event drains before the host closes Durable. Late contexts and
+  executors check the stopping flag. A bridge-local abort signal cancels only
+  request-side waits, including blocking duplicate retries; accepted Durable work
+  is not aborted. These are SDK integration points, not persistent state.
 - `list` uses Durable's descending task-ID scan and opaque cursor. SDK status and
-  timestamp filters are applied to translated records. The token binds its
-  cursor to the conversation and filters; history-length behavior remains the
-  SDK's. No in-memory task collection or copied task table is needed.
+  timestamp filters use record metadata, without building messages or reading
+  result text. Unfiltered counts use page lengths directly; only tasks in the
+  returned page become SDK snapshots. The token binds its cursor to the
+  conversation and filters; history-length behavior remains the SDK's. No
+  in-memory task collection or copied task table is needed.
 
 ## Evidence and remaining work
 
@@ -100,7 +107,14 @@ provider errors. Additional prototype tests cover:
   and non-mutating history truncation;
 - cancellation after reopening without a bus, repeated cancellation and stable
   canceled results after another reopen;
-- cancellation while still pending, before any submission or user entry exists.
+- cancellation while still pending, before any submission or user entry exists;
+- blocking and immediate duplicate retries with independent history options;
+- closing between admission and executor startup, and closing while a duplicate
+  is waiting, without aborting Durable work;
+- metadata-only list counting/filtering, with inaccessible unreturned answers.
+
+The parked-state checks gate the scripted model on an explicit promise and
+release it in cleanup, rather than relying on a short response-delay window.
 
 Before promoting this in #2, review the background-observer ownership choice and
 SDK overrides. Listing is deliberately simple: it scans to count matching tasks

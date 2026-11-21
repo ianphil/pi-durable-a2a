@@ -4,21 +4,32 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { CancelTaskRequest, GetTaskRequest, ListTasksRequest, SendMessageRequest, Task, TaskState } from '@a2a-js/sdk';
 import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory } from '@a2a-js/sdk/client';
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
+import { ServerCallContext } from '@a2a-js/sdk/server';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux';
 import { createRegistry, Harness, MemoryStorage } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { createA2AServer } from '../src/http.js';
-import { A2ABinding, A2AExtension, A2ATask, openDurableA2A } from '../src/prototype.js';
+import { A2ABinding, A2AExtension, A2ATask, durableTaskStore, openDurableA2A } from '../src/prototype.js';
 
 const token = 'a'.repeat(40);
 const delayed = (text, ms) => async () => {
   await new Promise((resolve) => setTimeout(resolve, ms));
   return fauxAssistantMessage(text);
 };
+function gatedResponse(text) {
+  const started = Promise.withResolvers();
+  const released = Promise.withResolvers();
+  return { started: started.promise, release: released.resolve, response: async () => {
+    started.resolve();
+    await released.promise;
+    return fauxAssistantMessage(text);
+  } };
+}
 const send = (messageId, text, configuration) => SendMessageRequest.fromJSON({
   message: { messageId, role: 'ROLE_USER', parts: [{ text }] }, configuration,
 });
@@ -223,41 +234,49 @@ test('prototype rolls back task and binding together and serializes concurrent a
     const scan = () => running.harness.commit((tx) => tx.scanTasks({ kind: 'a2a.task' }, 100), context);
     assert.equal((await scan()).items.length, 0);
 
-    faux.setResponses([delayed('Only one run', 150)]);
-    const duplicates = await Promise.all(Array.from({ length: 5 }, () =>
-      running.client.sendMessage(send('same-id', 'Same text', { returnImmediately: true }))));
-    assert.equal(new Set(duplicates.map((task) => task.id)).size, 1);
-    await running.harness.waitForTask(Number(duplicates[0].id), context);
+    const duplicateGate = gatedResponse('Only one run');
+    faux.setResponses([duplicateGate.response]);
+    let duplicateId;
+    try {
+      const duplicates = await Promise.all(Array.from({ length: 5 }, () =>
+        running.client.sendMessage(send('same-id', 'Same text', { returnImmediately: true }))));
+      assert.equal(new Set(duplicates.map((task) => task.id)).size, 1);
+      duplicateId = Number(duplicates[0].id);
+    } finally { duplicateGate.release(); }
+    await running.harness.waitForTask(duplicateId, context);
     assert.equal((await scan()).items.length, 1);
 
-    faux.setResponses([delayed('Winner', 150)]);
-    const competing = await Promise.allSettled(['one', 'two'].map((id) =>
-      running.client.sendMessage(send(id, id, { returnImmediately: true }))));
-    assert.equal(competing.filter((result) => result.status === 'fulfilled').length, 1);
-    assert.match(competing.find((result) => result.status === 'rejected').reason.message, /busy/i);
-    const winner = competing.find((result) => result.status === 'fulfilled').value;
-    await running.harness.waitForTask(Number(winner.id), context);
+    const competingGate = gatedResponse('Winner');
+    faux.setResponses([competingGate.response]);
+    let winnerId;
+    try {
+      const competing = await Promise.allSettled(['one', 'two'].map((id) =>
+        running.client.sendMessage(send(id, id, { returnImmediately: true }))));
+      assert.equal(competing.filter((result) => result.status === 'fulfilled').length, 1);
+      assert.match(competing.find((result) => result.status === 'rejected').reason.message, /busy/i);
+      winnerId = Number(competing.find((result) => result.status === 'fulfilled').value.id);
+    } finally { competingGate.release(); }
+    await running.harness.waitForTask(winnerId, context);
     assert.equal((await scan()).items.length, 2);
   });
 });
 
 test('prototype translates working state, history and filtered cursor pagination', { timeout: 5000 }, async () => {
   await fixture(async ({ faux, running }) => {
-    faux.setResponses([delayed('Working answer', 150)]);
-    const started = await running.client.sendMessage(send('working', 'Work', { returnImmediately: true }));
-    // Wait until the Durable submit phase has committed its park, not an arbitrary timer.
-    const watch = await running.harness.watchTaskGraph(context);
-    await new Promise((resolve) => {
-      const parked = (value) => Object.values(value.tasks).some((task) => String(task.id) === started.id && task.state.status === 'sleeping');
-      if (parked(watch.value)) resolve();
-      else watch.start((call) => { if (parked(call.value)) resolve(); });
-    });
-    await watch.stop();
-    const working = await running.client.getTask(GetTaskRequest.fromJSON({ id: started.id }));
-    assert.equal(working.status.state, TaskState.TASK_STATE_WORKING);
-    const record = await running.harness.getTask(Number(started.id), context);
-    assert.equal(record.state.status, 'sleeping');
-    assert.equal(record.state.signals[0].signal, 'pi.submission-settled');
+    const gate = gatedResponse('Working answer');
+    faux.setResponses([gate.response]);
+    let started;
+    try {
+      started = await running.client.sendMessage(send('working', 'Work', { returnImmediately: true }));
+      // The model cannot start before the submission and park commit together.
+      // Keep it gated across all HTTP/record reads; no sleeping state can be missed.
+      await gate.started;
+      const working = await running.client.getTask(GetTaskRequest.fromJSON({ id: started.id }));
+      assert.equal(working.status.state, TaskState.TASK_STATE_WORKING);
+      const record = await running.harness.getTask(Number(started.id), context);
+      assert.equal(record.state.status, 'sleeping');
+      assert.equal(record.state.signals[0].signal, 'pi.submission-settled');
+    } finally { gate.release(); }
     await running.harness.waitForTask(Number(started.id), context);
 
     faux.setResponses([fauxAssistantMessage('Second answer')]);
@@ -328,4 +347,159 @@ test('prototype cancellation before the submit phase does not create input', asy
     assert.ok(entries.items.every((entry) => entry.kind !== 'pi.user'));
     assert.equal((await harness.inspect(context)).submissions.length, 0);
   } finally { await harness.close(context); }
+});
+
+test('prototype retries honor blocking and history options without another task', { timeout: 5000 }, async () => {
+  await fixture(async ({ faux, running }) => {
+    const gate = gatedResponse('One answer');
+    const waiting = Promise.withResolvers();
+    const originalWait = running.harness.waitForTask.bind(running.harness);
+    let retry;
+    faux.setResponses([gate.response]);
+    try {
+      const first = await running.client.sendMessage(send('retry', 'Hello', { returnImmediately: true }));
+      await gate.started;
+      running.harness.waitForTask = (id, ctx) => {
+        const result = originalWait(id, ctx);
+        waiting.resolve();
+        return result;
+      };
+      let retrySettled = false;
+      retry = running.bridge.handler.sendMessage(send('retry', 'Hello', { historyLength: 1 }), new ServerCallContext());
+      retry.then(() => { retrySettled = true; }, () => { retrySettled = true; });
+      await waiting.promise;
+      await nextTurn();
+      assert.equal(retrySettled, false);
+      const immediate = await running.client.sendMessage(send('retry', 'Hello', { returnImmediately: true, historyLength: 0 }));
+      assert.equal(immediate.id, first.id);
+      assert.equal(immediate.status.state, TaskState.TASK_STATE_WORKING);
+      assert.equal(immediate.history.length, 0);
+      gate.release();
+      const completed = await retry;
+      assert.equal(completed.id, first.id);
+      assert.equal(completed.status.state, TaskState.TASK_STATE_COMPLETED);
+      assert.equal(completed.history.length, 1);
+      assert.match(JSON.stringify(completed.history), /One answer/);
+      const noHistory = await running.client.sendMessage(send('retry', 'Hello', { historyLength: 0 }));
+      assert.equal(noHistory.history.length, 0);
+      const full = await running.client.getTask(GetTaskRequest.fromJSON({ id: first.id }));
+      assert.equal(full.history.length, 2);
+      const tasks = await running.harness.commit((tx) => tx.scanTasks({ kind: 'a2a.task' }, 100), context);
+      assert.equal(tasks.items.length, 1);
+    } finally {
+      gate.release();
+      running.harness.waitForTask = originalWait;
+      if (retry) await Promise.allSettled([retry]);
+    }
+  });
+});
+
+test('prototype close joins a send between admission and SDK executor startup', { timeout: 5000 }, async () => {
+  await fixture(async ({ faux, running }) => {
+    const gate = gatedResponse('Work survives bridge close');
+    const entered = Promise.withResolvers();
+    const releaseContext = Promise.withResolvers();
+    const handler = running.bridge.handler;
+    const originalContext = handler._createRequestContext.bind(handler);
+    let closing;
+    faux.setResponses([gate.response]);
+    handler._createRequestContext = async (...args) => {
+      entered.resolve();
+      await releaseContext.promise;
+      return originalContext(...args);
+    };
+    const response = handler.sendMessage(send('shutdown-gap', 'Hello'), new ServerCallContext());
+    const rejected = assert.rejects(response, /stopping/i);
+    try {
+      await entered.promise;
+      await gate.started;
+      const binding = await running.harness.snapshot(A2ABinding, running.conversation.id, 'shutdown-gap', context);
+      assert.ok(binding.taskId);
+      let closed = false;
+      closing = running.bridge.close().then(() => { closed = true; });
+      await nextTurn();
+      assert.equal(closed, false, 'close must join the admitted send even before its bus exists');
+      releaseContext.resolve();
+      await rejected;
+      await closing;
+      const record = await running.harness.getTask(binding.taskId, context);
+      assert.equal(record.abortRequested, false);
+      assert.equal(record.state.status, 'sleeping');
+      await assert.rejects(handler.sendMessage(send('after-close', 'Hello'), new ServerCallContext()), /stopping/i);
+      gate.release();
+      assert.equal((await running.harness.waitForTask(binding.taskId, context)).state.outcome.status, 'completed');
+    } finally {
+      releaseContext.resolve();
+      gate.release();
+      handler._createRequestContext = originalContext;
+      await rejected;
+      if (closing) await closing;
+    }
+  });
+});
+
+test('prototype close cancels duplicate request waits but not Durable work', { timeout: 5000 }, async () => {
+  await fixture(async ({ faux, running }) => {
+    const gate = gatedResponse('Still runs');
+    const waiting = Promise.withResolvers();
+    const originalWait = running.harness.waitForTask.bind(running.harness);
+    let rejected;
+    faux.setResponses([gate.response]);
+    try {
+      const first = await running.client.sendMessage(send('close-retry', 'Hello', { returnImmediately: true }));
+      await gate.started;
+      running.harness.waitForTask = (id, ctx) => {
+        const result = originalWait(id, ctx);
+        waiting.resolve();
+        return result;
+      };
+      const retry = running.bridge.handler.sendMessage(send('close-retry', 'Hello'), new ServerCallContext());
+      rejected = assert.rejects(retry);
+      await waiting.promise;
+      await running.bridge.close();
+      await rejected;
+      const record = await running.harness.getTask(Number(first.id), context);
+      assert.equal(record.abortRequested, false);
+      assert.equal(record.state.status, 'sleeping');
+      gate.release();
+      assert.equal((await originalWait(record.id, context)).state.outcome.status, 'completed');
+    } finally {
+      gate.release();
+      running.harness.waitForTask = originalWait;
+      if (rejected) await rejected;
+    }
+  });
+});
+
+test('prototype counts and filters records without translating unreturned answers', async () => {
+  const visible = { id: 3, conversationId: 1, startedAt: 3000,
+    input: { messageId: 'visible', text: 'Small input', acceptedAt: 3000 },
+    state: { status: 'sleeping' } };
+  let answerReads = 0;
+  const hidden = (id) => ({ id, conversationId: 1, startedAt: 1000, endedAt: 2000,
+    get input() { throw new Error('Unreturned history must not be translated'); },
+    state: { status: 'terminal', outcome: { status: 'completed',
+      get result() { answerReads += 1; throw new Error('Unreturned answer must not be translated'); } } },
+  });
+  const records = [visible, hidden(2), hidden(1)];
+  const harness = { commit: async (change) => change({
+    async scanTasks(_query, limit, cursor) {
+      const offset = cursor?.offset ?? 0;
+      const next = offset + limit;
+      return { items: records.slice(offset, next), ...(next < records.length ? { next: { offset: next } } : {}) };
+    },
+  }) };
+  const store = durableTaskStore(harness, { id: 1 });
+  const all = await store.list({ pageSize: 1 });
+  assert.equal(all.totalSize, 3);
+  assert.equal(all.tasks[0].id, '3');
+  assert.ok(all.nextPageToken);
+  const working = await store.list({ pageSize: 1, status: TaskState.TASK_STATE_WORKING });
+  assert.equal(working.totalSize, 1);
+  assert.equal(working.tasks[0].id, '3');
+  assert.equal(working.nextPageToken, '');
+  const recent = await store.list({ pageSize: 1, statusTimestampAfter: new Date(2500).toISOString() });
+  assert.equal(recent.totalSize, 1);
+  assert.equal(recent.tasks[0].id, '3');
+  assert.equal(answerReads, 0);
 });

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { AgentCard, Message, Role, Task, TaskState } from '@a2a-js/sdk';
 import { AgentEvent, DefaultExecutionEventBusManager, DefaultRequestHandler, RequestContext } from '@a2a-js/sdk/server';
 import { ContentTypeNotSupportedError, RequestMalformedError, TaskNotCancelableError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
-import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
+import { BACKGROUND_CONTEXT as context, withAbortSignal } from '@earendil-works/chord/context';
 import { AssistantEntry, defineDoc, defineDocFamily, defineExtension, defineTask, InboxDoc, LiveDoc, SubmissionSettled } from '@earendil-works/pi-durable';
 
 const inputBytes = 16_384;
@@ -70,22 +70,33 @@ export const A2ATask = defineTask({
 
 export const A2AExtension = defineExtension({ name: 'a2a', tasks: [A2ATask] });
 
+function recordState(record) {
+  if (record.state.status !== 'terminal') return record.startedAt === undefined
+    ? TaskState.TASK_STATE_SUBMITTED : TaskState.TASK_STATE_WORKING;
+  switch (record.state.outcome.status) {
+    case 'completed': return TaskState.TASK_STATE_COMPLETED;
+    case 'aborted': return TaskState.TASK_STATE_CANCELED;
+    default: return TaskState.TASK_STATE_FAILED;
+  }
+}
+const recordTimestamp = (record) => record.endedAt ?? record.startedAt ?? record.input.acceptedAt;
+
 export function taskView(record) {
   const contextId = String(record.conversationId);
-  let state = record.startedAt === undefined ? 'TASK_STATE_SUBMITTED' : 'TASK_STATE_WORKING';
+  const state = recordState(record);
   let text;
   if (record.state.status === 'terminal') {
     const outcome = record.state.outcome;
-    if (outcome.status === 'completed') { state = 'TASK_STATE_COMPLETED'; text = outcome.result; }
-    else if (outcome.status === 'aborted') { state = 'TASK_STATE_CANCELED'; text = 'Canceled after execution settled'; }
-    else { state = 'TASK_STATE_FAILED'; text = outcome.status === 'failed' ? outcome.error.message : 'Execution unavailable'; }
+    if (outcome.status === 'completed') text = outcome.result;
+    else if (outcome.status === 'aborted') text = 'Canceled after execution settled';
+    else text = outcome.status === 'failed' ? outcome.error.message : 'Execution unavailable';
   }
   const user = { role: 'ROLE_USER', messageId: record.input.messageId, taskId: record.id,
     contextId, parts: [{ text: record.input.text }] };
   const message = text === undefined ? undefined : Message.fromJSON({ role: 'ROLE_AGENT',
     messageId: `${record.id}:answer`, taskId: record.id, contextId, parts: [{ text }] });
   return Task.fromJSON({ id: record.id, contextId,
-    status: { state, timestamp: new Date(record.endedAt ?? record.startedAt ?? record.input.acceptedAt).toISOString(),
+    status: { state, timestamp: new Date(recordTimestamp(record)).toISOString(),
       ...(message ? { message: Message.toJSON(message) } : {}) },
     history: [user, ...(message ? [Message.toJSON(message)] : [])],
   });
@@ -111,26 +122,28 @@ export function durableTaskStore(harness, conversation) {
           cursor = token.cursor;
         } catch { throw new RequestMalformedError('Invalid page token'); }
       }
-      const matches = (task) => (!params.contextId || task.contextId === params.contextId)
-        && (!params.status || task.status.state === params.status)
-        && (!params.statusTimestampAfter || Date.parse(task.status.timestamp) > Date.parse(params.statusTimestampAfter));
+      const after = params.statusTimestampAfter ? Date.parse(params.statusTimestampAfter) : undefined;
+      const matches = (record) => (!params.contextId || String(record.conversationId) === params.contextId)
+        && (!params.status || recordState(record) === params.status)
+        && (after === undefined || recordTimestamp(record) > after);
+      const filtered = params.contextId || params.status || after !== undefined;
       return harness.commit(async (tx) => {
         // Count and page from the same committed view. Filters not available in Durable are applied here.
         let totalSize = 0;
         let countCursor;
         do {
           const page = await tx.scanTasks(query, 100, countCursor);
-          totalSize += page.items.map(taskView).filter(matches).length;
+          totalSize += filtered ? page.items.filter(matches).length : page.items.length;
           countCursor = page.next;
         } while (countCursor);
         const tasks = [];
         let next;
         do {
           const page = await tx.scanTasks(query, 1, cursor);
-          const task = page.items[0] && taskView(page.items[0]);
-          if (task && matches(task)) {
+          const record = page.items[0];
+          if (record && matches(record)) {
             if (tasks.length === params.pageSize) break;
-            tasks.push(task);
+            tasks.push(taskView(record));
             next = page.next;
           }
           cursor = page.next;
@@ -151,6 +164,9 @@ export async function openDurableA2A({ harness, conversation, card: description 
   const buses = new DefaultExecutionEventBusManager(() => 'shared-agent');
   const waitingBuses = new Set();
   const drains = new Set();
+  const sends = new Set();
+  const stopWaiting = new AbortController();
+  const waitingContext = withAbortSignal(stopWaiting.signal, context);
   let stopping = false;
   const card = AgentCard.fromJSON({
     name: description.name, description: description.description, version: description.version ?? '0.1.0',
@@ -164,9 +180,12 @@ export async function openDurableA2A({ harness, conversation, card: description 
     async execute(request, bus) {
       waitingBuses.add(bus);
       try {
-        bus.publish(AgentEvent.task(await store.load(request.taskId)));
-        await harness.waitForTask(Number(request.taskId), context);
-        bus.publish(AgentEvent.task(await store.load(request.taskId)));
+        if (stopping) return;
+        const initial = await store.load(request.taskId);
+        if (stopping) return;
+        bus.publish(AgentEvent.task(initial));
+        await harness.waitForTask(Number(request.taskId), waitingContext);
+        if (!stopping) bus.publish(AgentEvent.task(await store.load(request.taskId)));
       } catch (error) {
         if (!stopping) throw error;
       } finally { waitingBuses.delete(bus); }
@@ -210,10 +229,17 @@ export async function openDurableA2A({ harness, conversation, card: description 
       // request normally, without its continuation-only terminal-state rejection.
       const validated = await super._createRequestContext({ ...params, message: { ...params.message, taskId: '' } }, ctx);
       const message = { ...validated.userMessage, taskId: params.message.taskId };
-      return new RequestContext({ ...validated.request, message }, message.taskId, contextId, ctx,
-        await store.load(message.taskId));
+      const task = await store.load(message.taskId);
+      if (stopping) throw new UnsupportedOperationError('Agent stopping');
+      return new RequestContext({ ...validated.request, message }, message.taskId, contextId, ctx, task);
     }
-    async sendMessage(params, ctx) {
+    sendMessage(params, ctx) {
+      if (stopping) return Promise.reject(new UnsupportedOperationError('Agent stopping'));
+      const send = this._sendMessage(params, ctx);
+      sends.add(send);
+      return send.finally(() => sends.delete(send));
+    }
+    async _sendMessage(params, ctx) {
       validateScope(params.tenant);
       const modes = params.configuration?.acceptedOutputModes;
       if (modes?.length && !modes.some((mode) => ['text/plain', 'text/*', '*/*'].includes(mode))) throw new ContentTypeNotSupportedError();
@@ -250,14 +276,24 @@ export async function openDurableA2A({ harness, conversation, card: description 
         admission.count += 1;
         return { id, duplicate: false };
       }, context);
-      if (accepted.duplicate) return store.load(accepted.id);
+      if (stopping) throw new UnsupportedOperationError('Agent stopping');
+      if (accepted.duplicate) {
+        if (params.configuration?.returnImmediately !== true) await harness.waitForTask(accepted.id, waitingContext);
+        const task = await store.load(accepted.id);
+        this._applyHistoryLengthSemantics(task, params.configuration ?? {});
+        return task;
+      }
       return super.sendMessage({ ...params, message: { ...m, taskId: accepted.id, contextId } }, ctx);
     }
   }
   return { handler: new Handler(card, store, executor, buses), card, contextId, store,
     async close() {
       stopping = true;
+      stopWaiting.abort(); // Cancel only request-side waits, never Durable execution.
       for (const bus of waitingBuses) bus.finished();
+      // Entry-to-response tracking covers sends that have admitted work but not
+      // registered a bus yet. Late executors see stopping and publish no events.
+      await Promise.allSettled([...sends]);
       await Promise.allSettled([...drains]);
     },
   };
