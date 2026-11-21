@@ -11,6 +11,11 @@ but cancellation can stop an unrelated host run after a handoff. The current
 prototype is not a safe production extension for arbitrary host activity; see
 [the cancellation decision](#cancellation-decision-still-open) below.
 
+**Prototype restriction:** all foreground work in the served conversation must
+come through A2A. No independent host submissions or automatic follow-up runs
+may share it. Separate host conversations are unaffected. This restriction
+avoids the unrelated-run hazard; it is not a claim of general scoped cancellation.
+
 The experiment is in `src/prototype.js`, intentionally not exported through the
 public package API. The existing SQLite bridge, dependencies and API remain in
 place until #2. Run it with:
@@ -58,7 +63,11 @@ abort handler.
 
 Cancellation before submission creates no input. Once submitted, the handler
 reacquires that submission by its request ID, withdraws it if queued, or aborts
-and joins the foreground scope if placed, then marks the A2A task aborted.
+and joins the foreground scope if placed. It then maps the actual settled
+submission through the same outcome logic as the normal answer phase. If an
+answer or failure won before cancellation, that outcome is preserved instead of
+being overwritten with canceled. A `CancelTask` request that loses this race is
+rejected as not cancelable; task reads report the actual completion/failure.
 Recovery is entirely the Durable scheduler's job: install the extension on each
 open and resume the harness. There is no A2A recovery scan or execution loop.
 
@@ -116,7 +125,9 @@ provider errors. Additional prototype tests cover:
 - blocking and immediate duplicate retries with independent history options;
 - closing between admission and executor startup, and closing while a duplicate
   is waiting, without aborting Durable work;
-- metadata-only list counting/filtering, with inaccessible unreturned answers.
+- metadata-only list counting/filtering, with inaccessible unreturned answers;
+- late cancellation after submission settlement preserves successful answers,
+  output-limit failures and sanitized execution failures, including after reopen.
 
 The parked-state and recovery-cancellation checks gate scripted models on
 explicit promises, rather than relying on short response-delay windows. Gates
@@ -129,7 +140,18 @@ SDK overrides. Listing is deliberately simple: it scans to count matching tasks
 and reads one record at a time for filtered cursor pagination. It orders by task
 creation, not the SDK database store's last-status-update order. Larger-page
 batching and whether exact totals are worth the scan are follow-up decisions,
-not reasons to duplicate storage.
+not reasons to duplicate storage. SDK 1.3.0 declares `totalSize` as a required
+numeric field; check the wire specification and SDK behavior before omitting it.
+The scan-only `harness.commit()` does not write a storage commit in Durable
+1.6.0: its zero-write transaction returns without calling storage. It still
+occupies the serialized commit line.
+
+The prototype's `admission.count` is a lifetime count and its 10,000-task cap is
+not a long-lived retention policy. #3 must define supported pruning/retention
+for task records and message bindings, including the idempotency window and
+restart-safe behavior; no manual scheduler-table deletion is proposed here.
+Remove the source-text comparison and duplicate contract body when #2 replaces
+the old bridge with a single extension-enabled fixture.
 
 ## Cancellation decision still open
 
@@ -143,9 +165,16 @@ This is a diagnostic, **not** a conformance test. It exits successfully when the
 known race reproduces and prints the observed failure. It pauses only the A2A
 abort invocation after `Submission.abort()` returns `already_placed`, lets that
 submission finish normally, then lets the host submit a new foreground run.
-Resuming the unchanged abort handler calls `conversation.abort()`, which cancels
-the new host run. The A2A submission was already done; the independent host input
-ends `unanswered` with reason `aborted`. No scheduler internals are modified.
+Resuming the abort handler's conversation-wide `conversation.abort()` call
+cancels the new host run. The A2A submission was already done; the independent
+host input ends `unanswered` with reason `aborted`. No scheduler internals are
+modified.
+
+The original probe also exposed a second bug: the observer discarded the settled
+submission and reported canceled even though its answer completed. That is now
+fixed: the observer reports completed with the original answer, while the probe
+still demonstrates the unrelated-host-run hazard. Fixing outcome reporting does
+not make the conversation-wide abort safe.
 
 Durable 1.6.0's public APIs explain the gap:
 
@@ -165,17 +194,22 @@ another asynchronous race. Setting another task's abort mark via internal
 `tx.setTask()` would duplicate scheduler responsibilities and is not an
 acceptable public API foundation for this library.
 
-**Recommendation to discuss before #2:** obtain a Durable submission-scoped
+**Recommended upstream capability:** obtain a Durable submission-scoped
 abort operation usable from task code. It should atomically withdraw queued
 input or mark the currently owning run while that submission is still unsettled,
 then join its cleanup. If the submission has settled, it must not touch a newer
 run. Durable must retain ownership of cancellation and recovery.
 
-Alternatively, accept an explicit prototype-only restriction that all foreground
-activity in the conversation comes through A2A, with no independent host runs.
-That explains the passing contract, but does not meet the eventual goal of
-turning any host conversation into an A2A agent. No ownership redesign or
-scheduler workaround has been implemented in this PR.
+For now, the prototype requires exclusive A2A foreground use as stated above.
+This covers a host that uses separate conversations for its other input, but does
+not meet the eventual goal of turning any host conversation into an A2A agent.
+Remove the restriction only after safe scoped cancellation exists and is tested
+against run handoffs and crash recovery. No ownership redesign or scheduler
+workaround has been implemented in this PR.
+
+A [feature-request draft](submission-scoped-abort-request-draft.md) records the
+reproduction and required semantics. It has not been filed upstream; the user
+decides where and when to submit it.
 
 Comprehensive joining of in-flight cancellation requests during listener shutdown
 is production integration work for #2, not further evidence for the store view.

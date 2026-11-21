@@ -11,7 +11,7 @@ import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { ServerCallContext } from '@a2a-js/sdk/server';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux';
-import { createRegistry, Harness, MemoryStorage } from '@earendil-works/pi-durable';
+import { createRegistry, defineExtension, defineTask, Harness, MemoryStorage } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { createA2AServer } from '../src/http.js';
 import { A2ABinding, A2AExtension, A2ATask, durableTaskStore, openDurableA2A } from '../src/prototype.js';
@@ -73,7 +73,7 @@ async function agent(dir, faux, models, port) {
     transports: [new JsonRpcTransportFactory({ fetchImpl })], cardResolver: new DefaultAgentCardResolver({ fetchImpl }),
   }).createFromUrl(base);
   return {
-    base, client, harness, conversation, bridge,
+    base, client, harness, conversation, bridge, registry,
     async close() {
       server.close();
       server.closeAllConnections();
@@ -519,4 +519,52 @@ test('prototype counts and filters records without translating unreturned answer
   assert.equal(recent.totalSize, 1);
   assert.equal(recent.tasks[0].id, '3');
   assert.equal(answerReads, 0);
+});
+
+test('prototype late cancellation preserves the submission outcome, not cancel intent', { timeout: 5000 }, async (t) => {
+  const cases = [
+    { name: 'completed answer', response: fauxAssistantMessage('Already answered'),
+      state: TaskState.TASK_STATE_COMPLETED, text: /Already answered/, submission: 'done' },
+    { name: 'oversized answer', response: fauxAssistantMessage('x'.repeat(65_537)),
+      state: TaskState.TASK_STATE_FAILED, text: /Answer exceeds result limit/, submission: 'done' },
+    { name: 'execution failure', response: fauxAssistantMessage('', { stopReason: 'error', errorMessage: 'PROVIDER_PRIVATE' }),
+      state: TaskState.TASK_STATE_FAILED, text: /Execution did not produce an answer/, submission: 'unanswered' },
+  ];
+  for (const example of cases) await t.test(example.name, async () => {
+    await fixture(async ({ faux, running, reopen }) => {
+      const answering = Promise.withResolvers();
+      // Hold only the observer's answer phase after Durable has settled input.
+      // Cancellation signals this invocation so its real abort handler can run.
+      const task = defineTask({ ...A2ATask.definition, phases: { ...A2ATask.definition.phases,
+        async answer(_task, runtime) {
+          await new Promise((resolve) => {
+            if (runtime.signal.aborted) resolve();
+            else runtime.signal.addEventListener('abort', resolve, { once: true });
+            answering.resolve();
+          });
+        },
+      } });
+      running.registry.install(defineExtension({ name: 'a2a', tasks: [task] }));
+      faux.setResponses([example.response]);
+      const started = await running.client.sendMessage(send('late-cancel', 'Hello', { returnImmediately: true }));
+      await answering.promise;
+      const pending = await running.harness.getTask(Number(started.id), context);
+      const submission = await running.harness.submission(pending.state.checkpoint.submissionId, context);
+      assert.equal((await submission.status(context)).status, example.submission);
+      // The A2A observer is still running, although its Durable input has settled.
+      await assert.rejects(running.client.cancelTask(CancelTaskRequest.fromJSON({ id: started.id })), /cancel/i);
+      const actual = await running.client.getTask(GetTaskRequest.fromJSON({ id: started.id }));
+      assert.equal(actual.status.state, example.state);
+      assert.match(JSON.stringify(actual.status), example.text);
+      assert.doesNotMatch(JSON.stringify(actual), /PROVIDER_PRIVATE/);
+      const record = await running.harness.getTask(Number(started.id), context);
+      assert.equal(record.abortRequested, true);
+      assert.notEqual(record.state.outcome.status, 'aborted');
+      await assert.rejects(running.client.cancelTask(CancelTaskRequest.fromJSON({ id: started.id })), /cancel/i);
+      const duplicate = await running.client.sendMessage(send('late-cancel', 'Hello'));
+      assert.deepEqual(duplicate, actual);
+      running = await reopen();
+      assert.deepEqual(await running.client.getTask(GetTaskRequest.fromJSON({ id: started.id })), actual);
+    });
+  });
 });

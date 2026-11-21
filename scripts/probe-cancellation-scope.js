@@ -66,12 +66,14 @@ try {
   const host = await hostSubmission.wait(context);
   // Exit successfully only when the current, documented limitation reproduces.
   // This is not the desired behavior: the independent host input should finish.
-  assert.equal(task.state.outcome.status, 'aborted');
+  assert.equal(task.state.outcome.status, 'completed');
+  assert.equal(task.state.outcome.result, 'A2A answer');
   assert.equal(host.status, 'unanswered');
   assert.equal(host.reason, 'aborted');
   console.log(JSON.stringify({ a2aSubmissionBeforeHandoff: 'done',
     hostSubmission: { status: host.status, reason: host.reason },
     a2aTask: task.state.outcome.status,
+    outcomeReporting: 'The completed A2A answer is preserved despite late cancel intent.',
     conclusion: 'Confirmed: A2A cancellation aborts an unrelated host run after a handoff.' }, null, 2));
 } finally {
   clearTimeout(timeout);

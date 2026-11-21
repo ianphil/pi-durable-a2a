@@ -20,6 +20,19 @@ const Admission = defineDoc({
   initial: () => ({ count: 0 }), checkpointWhen: () => true,
 });
 
+async function submissionOutcome(settled, runtime, ctx) {
+  if (settled?.status === 'done' && settled.type === 'input') {
+    const answer = await runtime.entry(AssistantEntry, settled.answer, ctx);
+    const text = answer?.model?.flatMap((m) => m.role === 'assistant'
+      ? m.content.filter((part) => part.type === 'text').map((part) => part.text) : []).join('\n') ?? '';
+    return Buffer.byteLength(text) > outputBytes
+      ? { status: 'failed', error: { message: 'Answer exceeds result limit' } }
+      : { status: 'completed', result: text };
+  }
+  return settled?.reason === 'aborted' ? { status: 'aborted' }
+    : { status: 'failed', error: { message: 'Execution did not produce an answer' } };
+}
+
 export const A2ATask = defineTask({
   name: 'a2a.task', version: 1,
   initial: () => ({ phase: 'submit' }),
@@ -37,34 +50,25 @@ export const A2ATask = defineTask({
     },
     async answer(_task, runtime, ctx) {
       const signal = await runtime.readSignal(SubmissionSettled, 'answer', ctx);
-      const settled = signal?.value;
-      let outcome;
-      if (settled?.status === 'done' && settled.type === 'input') {
-        const answer = await runtime.entry(AssistantEntry, settled.answer, ctx);
-        const text = answer?.model?.flatMap((m) => m.role === 'assistant'
-          ? m.content.filter((part) => part.type === 'text').map((part) => part.text) : []).join('\n') ?? '';
-        outcome = Buffer.byteLength(text) > outputBytes
-          ? { status: 'failed', error: { message: 'Answer exceeds result limit' } }
-          : { status: 'completed', result: text };
-      } else if (settled?.reason === 'aborted') {
-        outcome = { status: 'aborted' };
-      } else {
-        outcome = { status: 'failed', error: { message: 'Execution did not produce an answer' } };
-      }
+      const outcome = await submissionOutcome(signal?.value, runtime, ctx);
       await runtime.commit(() => ({ status: 'terminal', outcome }), ctx);
     },
   },
   async abort(task, runtime, ctx) {
     const conversation = await runtime.conversation(runtime.conversationId, ctx);
     // Reacquire by request ID only when submit committed. Never create input just to cancel it.
+    let outcome = { status: 'aborted' };
     if (task.state.checkpoint.submissionId) {
       const submission = await conversation.submit({
         type: 'input', content: task.input.text, requestId: `a2a:${task.input.messageId}`,
       }, ctx);
       if (await submission.abort(ctx) === 'already_placed') await conversation.abort(ctx);
-      await submission.wait(ctx);
+      // Cancellation intent must not replace an answer or failure that already won.
+      // The conversation-wide abort above still requires exclusive A2A foreground
+      // use until Durable exposes submission-scoped cancellation.
+      outcome = await submissionOutcome(await submission.wait(ctx), runtime, ctx);
     }
-    await runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), ctx);
+    await runtime.commit(() => ({ status: 'terminal', outcome }), ctx);
   },
 });
 
@@ -157,7 +161,11 @@ export function durableTaskStore(harness, conversation) {
   };
 }
 
-/** Prototype: install A2AExtension in the host registry before opening its harness. */
+/**
+ * Prototype: install A2AExtension before opening the harness. All foreground work
+ * in the served conversation must come through A2A; independent host input and
+ * automatic follow-up runs are unsupported until cancellation is submission-scoped.
+ */
 export async function openDurableA2A({ harness, conversation, card: description }) {
   const contextId = String(conversation.id);
   const store = durableTaskStore(harness, conversation);
