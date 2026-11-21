@@ -117,7 +117,8 @@ The listener serves:
 - **Listing uses Durable cursors.** Newest task IDs come first. Status/timestamp
   filters and exact totals currently scan records; only returned tasks are
   translated into SDK snapshots. Zero matches return immediately after the count
-  pass. Scan-only listing does not write a storage commit.
+  pass; a first page returning all matches skips further lookahead. Scan-only
+  listing does not write a storage commit.
 - **Capacity is currently a lifetime cap.** Each served conversation accepts at
   most 10,000 tasks. Retention/pruning and its idempotency window are not yet
   implemented; see [#3](https://github.com/ianphil/pi-durable-a2a/issues/3).

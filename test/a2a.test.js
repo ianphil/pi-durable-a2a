@@ -842,3 +842,61 @@ test('zero-match listing stops after the batched count pass', async () => {
   assert.deepEqual(page, { tasks: [], nextPageToken: '', pageSize: 1, totalSize: 0 });
   assert.equal(scans, count / 100);
 });
+
+test('first-page listing stops once all counted matches have been returned', async () => {
+  const count = 10_000;
+  const visible = { id: count, conversationId: 1, startedAt: 3000,
+    input: { messageId: 'working', text: 'Small input' }, state: { status: 'sleeping' } };
+  const hidden = { id: 1, conversationId: 1, endedAt: 2000,
+    state: { status: 'terminal', outcome: { status: 'completed' } },
+    get input() { throw new Error('Older completed task must not be translated'); },
+  };
+  let countScans = 0;
+  let pageScans = 0;
+  const harness = { commit: async (change) => change({
+    async scanTasks(_query, limit, cursor) {
+      const offset = cursor?.offset ?? 0;
+      if (limit === 100) countScans += 1;
+      else {
+        pageScans += 1;
+        assert.equal(limit, 1);
+        assert.equal(offset, 0, 'all matches are returned; no older-task lookahead is needed');
+      }
+      const next = Math.min(count, offset + limit);
+      const items = Array(next - offset).fill(hidden);
+      if (offset === 0) items[0] = visible;
+      return { items, ...(next < count ? { next: { offset: next } } : {}) };
+    },
+  }) };
+  const page = await durableTaskStore(harness, { id: 1 }).list({ pageSize: 1, status: TaskState.TASK_STATE_WORKING });
+  assert.equal(page.tasks.length, 1);
+  assert.equal(page.tasks[0].id, String(count));
+  assert.equal(page.totalSize, 1);
+  assert.equal(page.nextPageToken, '');
+  assert.equal(countScans, count / 100);
+  assert.equal(pageScans, 1);
+});
+
+test('public task snapshots mask arbitrary failed and faulted diagnostics', { timeout: 5000 }, async (t) => {
+  for (const status of ['failed', 'faulted']) await t.test(status, async () => {
+    await fixture(async ({ running }) => {
+      const diagnostic = 'PROVIDER_PRIVATE: internal execution detail';
+      const task = defineTask({ ...A2ATask.definition, phases: { ...A2ATask.definition.phases,
+        submit: (_task, runtime, ctx) => runtime.commit(() => ({ status: 'terminal',
+          outcome: { status, error: { message: diagnostic } } }), ctx),
+      } });
+      // Simulate a stored diagnostic not produced by the two public failure paths.
+      running.registry.install(defineExtension({ name: 'a2a', tasks: [task] }));
+      const sent = await running.client.sendMessage(send('diagnostic', 'Hello'));
+      const loaded = await running.client.getTask(GetTaskRequest.fromJSON({ id: sent.id }));
+      const listed = await running.client.listTasks(ListTasksRequest.fromJSON({}));
+      for (const snapshot of [sent, loaded, listed.tasks[0]]) {
+        assert.equal(snapshot.status.state, TaskState.TASK_STATE_FAILED);
+        assert.match(JSON.stringify(snapshot.status), /Execution unavailable/);
+        assert.doesNotMatch(JSON.stringify(snapshot), /PROVIDER_PRIVATE|internal execution detail/);
+      }
+      const stored = await running.harness.getTask(Number(sent.id), context);
+      assert.equal(stored.state.outcome.error.message, diagnostic, 'Durable keeps the full private diagnostic');
+    });
+  });
+});

@@ -7,6 +7,7 @@ import { AssistantEntry, defineDoc, defineDocFamily, defineExtension, defineTask
 
 const inputBytes = 16_384;
 const outputBytes = 65_536;
+const publicFailures = new Set(['Answer exceeds result limit', 'Execution did not produce an answer']);
 const terminal = new Set([TaskState.TASK_STATE_COMPLETED, TaskState.TASK_STATE_FAILED, TaskState.TASK_STATE_CANCELED]);
 const conversationScope = { scope: 'conversation', history: 'latest', fork: 'initial' };
 
@@ -102,7 +103,8 @@ export function taskView(record) {
     const outcome = record.state.outcome;
     if (outcome.status === 'completed') text = outcome.result;
     else if (outcome.status === 'aborted') text = 'Canceled after execution settled';
-    else text = outcome.status === 'failed' ? outcome.error.message : 'Execution unavailable';
+    else text = outcome.status === 'failed' && publicFailures.has(outcome.error?.message)
+      ? outcome.error.message : 'Execution unavailable';
   }
   const user = { role: 'ROLE_USER', messageId: record.input.messageId, taskId: record.id,
     contextId, parts: [{ text: record.input.text }] };
@@ -158,6 +160,9 @@ export function durableTaskStore(harness, conversation) {
           if (record && matches(record)) {
             if (tasks.length === params.pageSize) break;
             tasks.push(taskView(record));
+            // The first page has no preceding matches: once it returns the full
+            // counted set, no lookahead scan can find another page.
+            if (!params.pageToken && tasks.length === totalSize) { next = undefined; break; }
             next = page.next;
           }
           cursor = page.next;

@@ -82,8 +82,9 @@ open and resume the harness. There is no A2A recovery scan or execution loop.
   the scheduler's numeric-keyed live-task index; conversion matters for waits.
 - Pending records show submitted; started, parked and aborting records show
   working; only terminal aborted records show canceled. Result messages and
-  history are reconstructed with stable IDs and timestamps. Provider diagnostics
-  and unexpected task-fault details are not exposed.
+  history are reconstructed with stable IDs and timestamps. Only the two known
+  public failure messages are exposed; arbitrary failed/faulted diagnostics map
+  to `Execution unavailable`. Durable retains their private details.
 - `ResultManager` can perform its transient load/merge/save operations against
   the view. The executor publishes only snapshots derived from committed tasks;
   it waits for Durable, rather than owning execution. Duplicate sends reuse that
@@ -221,7 +222,9 @@ idempotent. A deterministic regression pauses cancellation at its first task
 read and again at its final read after cleanup: close must wait at both points.
 A storage-instrumented regression also verifies that scan-only listing produces
 no storage commits. If the batched count finds zero matches, listing returns an
-empty page immediately instead of making a second per-record scan.
+empty page immediately instead of making a second per-record scan. A first page
+also stops once it has returned all counted matches, avoiding lookahead through
+older nonmatching tasks. Broader sparse-cursor batching is not part of this fix.
 
 Upgrade regressions seed legacy bridge submissions without notifications, reopen
 the same conversation, and reuse their message IDs with new text: the new task
