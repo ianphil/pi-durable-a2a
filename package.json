@@ -1,0 +1,38 @@
+{
+  "name": "pi-durable-a2a",
+  "version": "0.1.0",
+  "description": "A2A integration for Pi Durable agents",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./litellm": "./src/litellm.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "1.3.0",
+    "better-sqlite3": "13.0.3",
+    "kysely": "0.29.8"
+  },
+  "peerDependencies": {
+    "@earendil-works/chord": "1.6.0",
+    "@earendil-works/pi-durable": "1.6.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.6.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ianphil/pi-durable-a2a.git"
+  }
+}
