@@ -1,4 +1,4 @@
-# Issue #1: Durable-native task prototype
+# Durable-native task design: #1 findings and #2 promotion
 
 ## Result
 
@@ -7,31 +7,30 @@ and Durable 1.6.0, `TaskStore.save` can store nothing. No SDK snapshot document 
 needed for the supported text-only, non-streaming protocol.
 
 **Cancellation design: still open.** The shared-conversation contract passes,
-but cancellation can stop an unrelated host run after a handoff. The current
-prototype is not a safe production extension for arbitrary host activity; see
+but cancellation can stop an unrelated host run after a handoff. The extension
+does not support arbitrary host activity in the served conversation; see
 [the cancellation decision](#cancellation-decision-still-open) below.
 
-**Prototype restriction:** all foreground work in the served conversation must
+**Current restriction:** all foreground work in the served conversation must
 come through A2A. No independent host submissions or automatic follow-up runs
 may share it. Separate host conversations are unaffected. This restriction
 avoids the unrelated-run hazard; it is not a claim of general scoped cancellation.
 
-The experiment is in `src/prototype.js`, intentionally not exported through the
-public package API. The existing SQLite bridge, dependencies and API remain in
-place until #2. Run it with:
+#1 proved this with an unexported experiment alongside the old SQLite bridge.
+#2 promotes that design to `src/a2a.js`: the public API exports `A2AExtension` and
+`openA2A({ harness, conversation, card })`. The second database, startup migration
+command, native SQLite dependency and bridge-owned recovery loop are removed.
 
 ```sh
-node --test test/prototype.test.js
-# Or run the old bridge, registry and prototype tests together:
+node --test test/a2a.test.js
 npm test
 ```
 
-`test/a2a.test.js` is untouched. The prototype fixture installs `A2AExtension`
-before opening the harness and passes the harness to `openDurableA2A` instead of
-an A2A database path. Its contract test body is byte-for-byte the same as the
-original; a test checks that equality. Thus the behavior passes unchanged,
-although the original empty-registry fixture cannot install a real extension
-without adaptation.
+The #1 experiment checked that its contract body was byte-for-byte the same as
+the original, with a fixture that installed `A2AExtension` before opening Durable.
+#2 consolidates this into one extension-enabled `test/a2a.test.js`, preserving
+those assertions and the regressions. The duplicate fixture/body and brittle
+source-text comparison are gone.
 
 ## Stored layout being evaluated
 
@@ -46,7 +45,10 @@ on the commit line. The binding and task are created in one commit; rejected or
 rolled-back admission creates neither. Concurrent identical IDs find one task;
 competing new IDs cannot both take the slot. The task submits in its own next
 commit and parks on Durable's built-in `SubmissionSettled` signal. Submission
-creation and the parked checkpoint commit together.
+creation and the parked checkpoint commit together. New submissions use the
+request ID `a2a.task:<Durable task ID>`, independent of the caller's message ID.
+This prevents adoption of old bridge submissions keyed as `a2a:<message ID>`
+which lack the observer's settlement notification.
 
 The A2A task is a **background observer**, not the owner of the foreground
 `pi.generation` task. This is necessary with the current conversation APIs: its
@@ -62,7 +64,8 @@ Do not use a background-inclusive conversation abort from the observer's own
 abort handler.
 
 Cancellation before submission creates no input. Once submitted, the handler
-reacquires that submission by its request ID, withdraws it if queued, or aborts
+reads the request ID from its committed submission record and reacquires that
+exact submission, withdraws it if queued, or aborts
 and joins the foreground scope if placed. It then maps the actual settled
 submission through the same outcome logic as the normal answer phase. If an
 answer or failure won before cancellation, that outcome is preserved instead of
@@ -79,8 +82,9 @@ open and resume the harness. There is no A2A recovery scan or execution loop.
   the scheduler's numeric-keyed live-task index; conversion matters for waits.
 - Pending records show submitted; started, parked and aborting records show
   working; only terminal aborted records show canceled. Result messages and
-  history are reconstructed with stable IDs and timestamps. Provider diagnostics
-  and unexpected task-fault details are not exposed.
+  history are reconstructed with stable IDs and timestamps. Only the two known
+  public failure messages are exposed; arbitrary failed/faulted diagnostics map
+  to `Execution unavailable`. Durable retains their private details.
 - `ResultManager` can perform its transient load/merge/save operations against
   the view. The executor publishes only snapshots derived from committed tasks;
   it waits for Durable, rather than owning execution. Duplicate sends reuse that
@@ -135,8 +139,8 @@ also respond to the model's abort signal, so shutdown/cancellation can stop them
 without releasing an answer. Recovery checks wait for the original model to be
 aborted and the resumed model to start before canceling; cleanup releases both.
 
-Before promoting this in #2, review the background-observer ownership choice and
-SDK overrides. Listing is deliberately simple: it scans to count matching tasks
+The core retains the background-observer ownership choice and pinned-SDK
+integration points proved in #1. Listing is deliberately simple: it scans to count matching tasks
 and reads one record at a time for filtered cursor pagination. It orders by task
 creation, not the SDK database store's last-status-update order. Larger-page
 batching and whether exact totals are worth the scan are follow-up decisions,
@@ -146,12 +150,12 @@ The scan-only `harness.commit()` does not write a storage commit in Durable
 1.6.0: its zero-write transaction returns without calling storage. It still
 occupies the serialized commit line.
 
-The prototype's `admission.count` is a lifetime count and its 10,000-task cap is
+The current `admission.count` is a lifetime count and its 10,000-task cap is
 not a long-lived retention policy. #3 must define supported pruning/retention
 for task records and message bindings, including the idempotency window and
 restart-safe behavior; no manual scheduler-table deletion is proposed here.
-Remove the source-text comparison and duplicate contract body when #2 replaces
-the old bridge with a single extension-enabled fixture.
+#2 removed the source-text comparison and duplicate contract body in favor of
+one extension-enabled fixture.
 
 ## Cancellation decision still open
 
@@ -200,7 +204,7 @@ input or mark the currently owning run while that submission is still unsettled,
 then join its cleanup. If the submission has settled, it must not touch a newer
 run. Durable must retain ownership of cancellation and recovery.
 
-For now, the prototype requires exclusive A2A foreground use as stated above.
+For now, the extension requires exclusive A2A foreground use as stated above.
 This covers a host that uses separate conversations for its other input, but does
 not meet the eventual goal of turning any host conversation into an A2A agent.
 Remove the restriction only after safe scoped cancellation exists and is tested
@@ -211,9 +215,22 @@ A [feature-request draft](submission-scoped-abort-request-draft.md) records the
 reproduction and required semantics. It has not been filed upstream; the user
 decides where and when to submit it.
 
-Comprehensive joining of in-flight cancellation requests during listener shutdown
-is production integration work for #2, not further evidence for the store view.
-We are not chasing a clean automated review by expanding #1 into that work.
+#2 completes listener shutdown coordination: `close()` blocks new task requests,
+stops only request-side waits, joins accepted sends/reads/cancellations and SDK
+drains/executor readers, then returns so the host can close Durable. It is
+idempotent. A deterministic regression pauses cancellation at its first task
+read and again at its final read after cleanup: close must wait at both points.
+A storage-instrumented regression also verifies that scan-only listing produces
+no storage commits. If the batched count finds zero matches, listing returns an
+empty page immediately instead of making a second per-record scan. A first page
+also stops once it has returned all counted matches, avoiding lookahead through
+older nonmatching tasks. Broader sparse-cursor batching is not part of this fix.
+
+Upgrade regressions seed legacy bridge submissions without notifications, reopen
+the same conversation, and reuse their message IDs with new text: the new task
+must get a distinct, notified submission, execute normally and cancel its own
+work. Another regression reopens an older prototype checkpoint and confirms
+abort uses its actual stored request ID rather than creating replacement input.
 
 Names and versions above describe the experiment, not a finalized public
 storage contract. #3 finalizes and documents that contract and adds killable

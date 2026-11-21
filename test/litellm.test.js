@@ -43,7 +43,7 @@ test('publishes once, recovers ownership, preserves other grants and withdraws o
     teamId: 'fleet', grantLockDirectory: join(dir, 'grant-lock'),
   });
   const agent = {
-    name: 'test-agent', description: 'Test agent', listener: 'http://100.82.9.79:8766/', token: 'private-listener-token',
+    name: 'test-agent', description: 'Test agent', listener: 'http://agent.example:8766/', token: 'private-listener-token',
     skills: [{ id: 'chat', name: 'Chat', description: 'Talk', tags: [] }],
   };
   let saved;
@@ -55,7 +55,7 @@ test('publishes once, recovers ownership, preserves other grants and withdraws o
     failGrant = false;
     await registry.publish(agent, saved, (value) => { saved = value; });
     assert.equal(creates, 1);
-    assert.equal(records[0].agent_card_params.url, 'http://100.82.9.79:8766');
+    assert.equal(records[0].agent_card_params.url, 'http://agent.example:8766');
     assert.deepEqual(permissions, { agents: ['unrelated', 'owned-id'], vector_stores: ['preserve-me'] });
 
     // Lost local ownership: the exact name, URL and token adopt the existing record.
