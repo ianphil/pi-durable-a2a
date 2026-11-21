@@ -23,12 +23,20 @@ const delayed = (text, ms) => async () => {
 };
 function gatedResponse(text) {
   const started = Promise.withResolvers();
+  const aborted = Promise.withResolvers();
   const released = Promise.withResolvers();
-  return { started: started.promise, release: released.resolve, response: async () => {
-    started.resolve();
-    await released.promise;
-    return fauxAssistantMessage(text);
-  } };
+  return { started: started.promise, aborted: aborted.promise, release: released.resolve,
+    response: async (_transcript, options) => {
+      const onAbort = () => { aborted.resolve(); released.resolve(); };
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
+      if (options?.signal?.aborted) onAbort();
+      started.resolve();
+      try {
+        await released.promise;
+        return fauxAssistantMessage(text);
+      } finally { options?.signal?.removeEventListener('abort', onAbort); }
+    },
+  };
 }
 const send = (messageId, text, configuration) => SendMessageRequest.fromJSON({
   message: { messageId, role: 'ROLE_USER', parts: [{ text }] }, configuration,
@@ -302,22 +310,31 @@ test('prototype translates working state, history and filtered cursor pagination
   });
 });
 
-test('prototype cancels recovered work without an SDK bus and preserves the result', async () => {
+test('prototype cancels recovered work without an SDK bus and preserves the result', { timeout: 5000 }, async () => {
   await fixture(async ({ faux, running, reopen }) => {
-    faux.setResponses([delayed('Interrupted', 200)]);
-    const pending = await running.client.sendMessage(send('restart-cancel', 'Work', { returnImmediately: true }));
-    faux.setResponses([delayed('Must not complete', 300)]);
-    running = await reopen();
-    const duplicate = await running.client.sendMessage(send('restart-cancel', 'Work', { returnImmediately: true }));
-    assert.equal(duplicate.id, pending.id);
-    const canceled = await running.client.cancelTask(CancelTaskRequest.fromJSON({ id: pending.id }));
-    assert.equal(canceled.status.state, TaskState.TASK_STATE_CANCELED);
-    await running.conversation.waitForIdle(context);
-    running = await reopen();
-    const restored = await running.client.getTask(GetTaskRequest.fromJSON({ id: pending.id }));
-    assert.deepEqual(restored, canceled);
-    const repeated = await running.client.cancelTask(CancelTaskRequest.fromJSON({ id: pending.id }));
-    assert.deepEqual(repeated, canceled);
+    const original = gatedResponse('Interrupted');
+    const recovered = gatedResponse('Must not complete');
+    faux.setResponses([original.response]);
+    try {
+      const pending = await running.client.sendMessage(send('restart-cancel', 'Work', { returnImmediately: true }));
+      await original.started;
+      faux.setResponses([recovered.response]);
+      running = await reopen(); // Close aborts the first model gate, never releases an answer.
+      await original.aborted;
+      await recovered.started;
+      const duplicate = await running.client.sendMessage(send('restart-cancel', 'Work', { returnImmediately: true }));
+      assert.equal(duplicate.id, pending.id);
+      assert.equal(duplicate.status.state, TaskState.TASK_STATE_WORKING);
+      const canceled = await running.client.cancelTask(CancelTaskRequest.fromJSON({ id: pending.id }));
+      await recovered.aborted;
+      assert.equal(canceled.status.state, TaskState.TASK_STATE_CANCELED);
+      await running.conversation.waitForIdle(context);
+      running = await reopen();
+      const restored = await running.client.getTask(GetTaskRequest.fromJSON({ id: pending.id }));
+      assert.deepEqual(restored, canceled);
+      const repeated = await running.client.cancelTask(CancelTaskRequest.fromJSON({ id: pending.id }));
+      assert.deepEqual(repeated, canceled);
+    } finally { original.release(); recovered.release(); }
   });
 });
 

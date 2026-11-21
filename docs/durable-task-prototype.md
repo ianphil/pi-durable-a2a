@@ -2,9 +2,14 @@
 
 ## Result
 
-**Go with a translated, read-only SDK store.** On SDK 1.3.0 and Durable 1.6.0,
-`TaskStore.save` can store nothing. No SDK snapshot document is needed for the
-supported text-only, non-streaming protocol.
+**Storage feasibility: go with a translated, read-only SDK store.** On SDK 1.3.0
+and Durable 1.6.0, `TaskStore.save` can store nothing. No SDK snapshot document is
+needed for the supported text-only, non-streaming protocol.
+
+**Cancellation design: still open.** The shared-conversation contract passes,
+but cancellation can stop an unrelated host run after a handoff. The current
+prototype is not a safe production extension for arbitrary host activity; see
+[the cancellation decision](#cancellation-decision-still-open) below.
 
 The experiment is in `src/prototype.js`, intentionally not exported through the
 public package API. The existing SQLite bridge, dependencies and API remain in
@@ -113,8 +118,11 @@ provider errors. Additional prototype tests cover:
   is waiting, without aborting Durable work;
 - metadata-only list counting/filtering, with inaccessible unreturned answers.
 
-The parked-state checks gate the scripted model on an explicit promise and
-release it in cleanup, rather than relying on a short response-delay window.
+The parked-state and recovery-cancellation checks gate scripted models on
+explicit promises, rather than relying on short response-delay windows. Gates
+also respond to the model's abort signal, so shutdown/cancellation can stop them
+without releasing an answer. Recovery checks wait for the original model to be
+aborted and the resumed model to start before canceling; cleanup releases both.
 
 Before promoting this in #2, review the background-observer ownership choice and
 SDK overrides. Listing is deliberately simple: it scans to count matching tasks
@@ -122,6 +130,56 @@ and reads one record at a time for filtered cursor pagination. It orders by task
 creation, not the SDK database store's last-status-update order. Larger-page
 batching and whether exact totals are worth the scan are follow-up decisions,
 not reasons to duplicate storage.
+
+## Cancellation decision still open
+
+The review's cancellation-scope concern reproduces with real Durable tasks:
+
+```sh
+node scripts/probe-cancellation-scope.js
+```
+
+This is a diagnostic, **not** a conformance test. It exits successfully when the
+known race reproduces and prints the observed failure. It pauses only the A2A
+abort invocation after `Submission.abort()` returns `already_placed`, lets that
+submission finish normally, then lets the host submit a new foreground run.
+Resuming the unchanged abort handler calls `conversation.abort()`, which cancels
+the new host run. The A2A submission was already done; the independent host input
+ends `unanswered` with reason `aborted`. No scheduler internals are modified.
+
+Durable 1.6.0's public APIs explain the gap:
+
+- `Submission.abort()` / `Harness.abortSubmission()` withdraw queued input, but
+  return `already_placed` rather than stopping the run for placed input.
+- A task's conversation handle exposes conversation-wide `abort()`, with no
+  submission/run selector or transaction overload.
+- `TaskRuntime.abortOwned()` only stops tasks the caller owns. The observer does
+  not own the conversation's generation, so it cannot use this for its run.
+- `Harness.abortTask()` can target a task, but is not a general task-runtime
+  capability. Moreover, `LiveDoc.run.taskId` is handed from one generation to the
+  next during tool rounds: capturing one generation ID is not a durable logical
+  run cancellation mechanism.
+
+Rechecking submission status before calling `conversation.abort()` leaves
+another asynchronous race. Setting another task's abort mark via internal
+`tx.setTask()` would duplicate scheduler responsibilities and is not an
+acceptable public API foundation for this library.
+
+**Recommendation to discuss before #2:** obtain a Durable submission-scoped
+abort operation usable from task code. It should atomically withdraw queued
+input or mark the currently owning run while that submission is still unsettled,
+then join its cleanup. If the submission has settled, it must not touch a newer
+run. Durable must retain ownership of cancellation and recovery.
+
+Alternatively, accept an explicit prototype-only restriction that all foreground
+activity in the conversation comes through A2A, with no independent host runs.
+That explains the passing contract, but does not meet the eventual goal of
+turning any host conversation into an A2A agent. No ownership redesign or
+scheduler workaround has been implemented in this PR.
+
+Comprehensive joining of in-flight cancellation requests during listener shutdown
+is production integration work for #2, not further evidence for the store view.
+We are not chasing a clean automated review by expanding #1 into that work.
 
 Names and versions above describe the experiment, not a finalized public
 storage contract. #3 finalizes and documents that contract and adds killable
