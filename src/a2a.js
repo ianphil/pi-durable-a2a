@@ -313,6 +313,7 @@ export async function openA2A(options) {
         }
         const admission = await tx.doc(Admission, conversation.id);
         const active = admission.active && await tx.task(admission.active);
+        if (active) checkTaskVersion(active);
         const live = await tx.doc(LiveDoc, conversation.id);
         const inbox = await tx.doc(InboxDoc, conversation.id);
         if (stopping || (active && active.state.status !== 'terminal') || live.run || inbox.items.length) {

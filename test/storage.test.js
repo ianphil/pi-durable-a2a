@@ -47,11 +47,11 @@ function modelGate(text, onAbort) {
   } };
 }
 
-async function host(storage, faux, terminals = []) {
+async function host(storage, faux, terminals = [], extension = A2AExtension) {
   const models = createModels();
   models.setProvider(faux.provider);
   const registry = createRegistry();
-  registry.install(A2AExtension);
+  registry.install(extension);
   const harness = await Harness.open(storage, {
     models, registry, settings: { retry: { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 } },
   }, context);
@@ -100,6 +100,8 @@ test('storage loss during a model request recovers one task and one admission', 
       const taskId = Number(pending.id);
       const record = await running.harness.getTask(taskId, context);
       assert.equal(record.state.status, 'sleeping');
+      assert.equal(record.state.checkpoint.phase, 'answer');
+      assert.ok(Number.isSafeInteger(record.input.acceptedAt));
       const submissionId = record.state.checkpoint.submissionId;
       crashing.kill();
       const stoppedRequests = running.a2a.close(); // Only clean up request resources after storage is dead.
@@ -251,7 +253,7 @@ test('persisted version-1 names, binding layout and submission keys remain stabl
   });
 });
 
-test('reads refuse future task versions without rewriting stored records', async () => {
+test('reads refuse future task versions without rewriting stored records', { timeout: 10_000 }, async () => {
   await directory(async (path) => {
     const faux = fauxProvider();
     const running = await host(await openNodeSqliteStorage(path), faux);
@@ -260,11 +262,13 @@ test('reads refuse future task versions without rewriting stored records', async
       const hash = createHash('sha256').update('Hello').digest('hex');
       const id = await running.conversation.commit(async (tx) => {
         const binding = await tx.doc(A2ABinding, running.conversation.id, 'future', null);
+        const admission = await tx.doc(LegacyAdmission, running.conversation.id);
         const taskId = await tx.createTask(future,
           { messageId: 'future', text: 'Hello', hash, acceptedAt: Date.now() },
           { ownership: { kind: 'conversation' }, background: true });
         binding.taskId = taskId;
         binding.hash = hash;
+        admission.active = taskId;
         return taskId;
       }, context);
       const before = await running.harness.getTask(id, context);
@@ -277,6 +281,44 @@ test('reads refuse future task versions without rewriting stored records', async
         { statusTimestampAfter: '9999-01-01T00:00:00.000Z' },
       ]) await assert.rejects(running.a2a.handler.listTasks(ListTasksRequest.fromJSON(filter), call()), /Unsupported stored/);
       await assert.rejects(running.a2a.handler.sendMessage(message('future'), call()), /Unsupported stored/);
+      await assert.rejects(running.a2a.handler.sendMessage(message('new-message'), call()), /Unsupported stored/);
+      assert.equal(await running.harness.snapshot(A2ABinding, running.conversation.id, 'new-message', context), undefined);
+      assert.deepEqual(await running.harness.getTask(id, context), before);
+    } finally { await running.close(); }
+  });
+});
+
+test('admission refuses a terminal future-version active task without replacing it', { timeout: 10_000 }, async () => {
+  await directory(async (path) => {
+    const faux = fauxProvider();
+    const future = defineTask({ ...A2ATask.definition, version: 2, phases: { ...A2ATask.definition.phases,
+      submit: (_task, runtime, ctx) => runtime.commit(() => ({ status: 'terminal',
+        outcome: { status: 'completed', result: 'Future result' } }), ctx),
+    } });
+    const futureExtension = { ...A2AExtension, tasks: [future] };
+    let running = await host(await openNodeSqliteStorage(path), faux, [], futureExtension);
+    try {
+      const hash = createHash('sha256').update('Hello').digest('hex');
+      const id = await running.conversation.commit(async (tx) => {
+        const binding = await tx.doc(A2ABinding, running.conversation.id, 'completed-future', null);
+        const admission = await tx.doc(LegacyAdmission, running.conversation.id);
+        const taskId = await tx.createTask(future, { messageId: 'completed-future', text: 'Hello', hash, acceptedAt: Date.now() },
+          { ownership: { kind: 'conversation' }, background: true });
+        binding.taskId = taskId;
+        binding.hash = hash;
+        admission.active = taskId;
+        return taskId;
+      }, context);
+      await running.harness.waitForTask(id, context);
+      await running.close();
+      running = await host(await openNodeSqliteStorage(path), faux); // Older, version-1 definitions.
+      const before = await running.harness.getTask(id, context);
+      assert.equal(before.version, 2);
+      assert.equal(before.state.status, 'terminal');
+      await assert.rejects(running.a2a.handler.sendMessage(message('after-future'), call()), /Unsupported stored/);
+      const admission = await running.harness.snapshot(LegacyAdmission, running.conversation.id, context);
+      assert.equal(admission.active, id);
+      assert.equal(await running.harness.snapshot(A2ABinding, running.conversation.id, 'after-future', context), undefined);
       assert.deepEqual(await running.harness.getTask(id, context), before);
     } finally { await running.close(); }
   });
