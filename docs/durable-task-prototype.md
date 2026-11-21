@@ -1,4 +1,4 @@
-# Durable-native task design: #1 findings and #2 promotion
+# Durable-native task design: #1 findings and core follow-up
 
 ## Result
 
@@ -38,7 +38,7 @@ source-text comparison are gone.
 | --- | --- | --- | --- |
 | `a2a.task` | Conversation-owned task | 1 | Input: message ID, text, hash, acceptance time. Checkpoint: submit, or answer with submission ID. Outcome: answer text, sanitized failure, or aborted. |
 | `a2a.message` | Latest conversation document family, keyed by message ID | 1 | Task ID and content hash. Forks start empty. |
-| `a2a.admission` | Latest conversation document | 1 | Most recently admitted task ID and admission count. Forks start empty. |
+| `a2a.admission` | Latest conversation document | 1 | Most recently admitted task ID. Older admission counts are ignored. Forks start empty. |
 
 Admission checks the binding, the last task, and Durable's live/inbox documents
 on the commit line. The binding and task are created in one commit; rejected or
@@ -150,10 +150,11 @@ The scan-only `harness.commit()` does not write a storage commit in Durable
 1.6.0: its zero-write transaction returns without calling storage. It still
 occupies the serialized commit line.
 
-The current `admission.count` is a lifetime count and its 10,000-task cap is
-not a long-lived retention policy. #3 must define supported pruning/retention
-for task records and message bindings, including the idempotency window and
-restart-safe behavior; no manual scheduler-table deletion is proposed here.
+#3 removes the artificial lifetime admission count and 10,000-task cap. The
+`active` task pointer remains for atomic busy rejection; old `count` fields are
+ignored without rewriting records. This library does not implement general
+retention, pruning or archiving for Durable. Storage growth and resource policy
+belong to the host and Durable, not a second A2A lifecycle subsystem.
 #2 removed the source-text comparison and duplicate contract body in favor of
 one extension-enabled fixture.
 
@@ -232,9 +233,12 @@ must get a distinct, notified submission, execute normally and cancel its own
 work. Another regression reopens an older prototype checkpoint and confirms
 abort uses its actual stored request ID rather than creating replacement input.
 
-Names and versions above describe the experiment, not a finalized public
-storage contract. #3 finalizes and documents that contract and adds killable
-storage/crash tests. Authentication, identity-based conversation selection,
-optional gateway routes, consumer deployment and release changes remain in
-#4–#9. This experiment uses local scripted models only; no fleet access or
+#3 records these names and version-1 layouts as the [stored contract](storage-contract.md),
+including future migration policy and refusal of unknown task versions. Its
+killable-storage tests interrupt a model attempt and cancellation cleanup without
+saving clean-harness-shutdown checkpoints, then verify one task/admission and
+stable terminal outcomes across reopen. Model retries remain Durable policy,
+not an exactly-once promise. Authentication, identity-based conversation
+selection, optional gateway routes, consumer deployment and release changes
+remain in #4–#9. This experiment uses local scripted models only; no fleet access or
 GitHub writes are involved.

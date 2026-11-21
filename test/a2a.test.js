@@ -479,11 +479,11 @@ test('close cancels duplicate request waits but not Durable work', { timeout: 50
 });
 
 test('counts and filters records without translating unreturned answers', async () => {
-  const visible = { id: 3, conversationId: 1, startedAt: 3000,
+  const visible = { id: 3, version: 1, conversationId: 1, startedAt: 3000,
     input: { messageId: 'visible', text: 'Small input', acceptedAt: 3000 },
     state: { status: 'sleeping' } };
   let answerReads = 0;
-  const hidden = (id) => ({ id, conversationId: 1, startedAt: 1000, endedAt: 2000,
+  const hidden = (id) => ({ id, version: 1, conversationId: 1, startedAt: 1000, endedAt: 2000,
     get input() { throw new Error('Unreturned history must not be translated'); },
     state: { status: 'terminal', outcome: { status: 'completed',
       get result() { answerReads += 1; throw new Error('Unreturned answer must not be translated'); } } },
@@ -824,7 +824,7 @@ test('cancellation reacquires the stored submission for older prototype checkpoi
 test('zero-match listing stops after the batched count pass', async () => {
   let scans = 0;
   const count = 10_000;
-  const record = { id: 1, conversationId: 1, endedAt: 2000,
+  const record = { id: 1, version: 1, conversationId: 1, endedAt: 2000,
     state: { status: 'terminal', outcome: { status: 'completed' } },
     get input() { throw new Error('No snapshot should be built'); },
   };
@@ -845,9 +845,9 @@ test('zero-match listing stops after the batched count pass', async () => {
 
 test('first-page listing stops once all counted matches have been returned', async () => {
   const count = 10_000;
-  const visible = { id: count, conversationId: 1, startedAt: 3000,
+  const visible = { id: count, version: 1, conversationId: 1, startedAt: 3000,
     input: { messageId: 'working', text: 'Small input' }, state: { status: 'sleeping' } };
-  const hidden = { id: 1, conversationId: 1, endedAt: 2000,
+  const hidden = { id: 1, version: 1, conversationId: 1, endedAt: 2000,
     state: { status: 'terminal', outcome: { status: 'completed' } },
     get input() { throw new Error('Older completed task must not be translated'); },
   };

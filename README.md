@@ -9,7 +9,8 @@ protocol. Each accepted message creates a Durable `a2a.task`, which submits to t
 conversation and parks until the submission settles. The SDK task store is a
 read-only translation of Durable records, not a second copy. Task records,
 message-ID bindings, results, cancellation and recovery all live in the host's
-Durable store. Backups need only that store.
+Durable store. Backups need only that store. Stored identifiers, version-1 layouts
+and the migration policy are documented in the [storage contract](docs/storage-contract.md).
 
 Status: early. Targets A2A wire version `1.0`, `@a2a-js/sdk` 1.3.0 and Pi Durable
 1.6.0. The design comes from [Genesis Durable](https://github.com/ianphil/genesis-durable)'s
@@ -119,9 +120,10 @@ The listener serves:
   translated into SDK snapshots. Zero matches return immediately after the count
   pass; a first page returning all matches skips further lookahead. Scan-only
   listing does not write a storage commit.
-- **Capacity is currently a lifetime cap.** Each served conversation accepts at
-  most 10,000 tasks. Retention/pruning and its idempotency window are not yet
-  implemented; see [#3](https://github.com/ianphil/pi-durable-a2a/issues/3).
+- **Storage policy belongs to the host and Durable.** This library imposes no
+  task-count quota or expiration window and does not prune/archive records.
+  Message bindings and results remain available while retained in Durable.
+  Removing the former lifetime cap is not a claim that storage growth is bounded.
 - **No exactly-once side effects.** Durable may repeat interrupted tool calls
   according to each tool's replay policy. Tools with external effects need their
   own reconciliation.
@@ -196,8 +198,11 @@ npm test
 
 The tests use one extension-enabled Durable harness fixture on SQLite and the
 official SDK client, including restart, concurrent admission, late cancellation
-and ordered shutdown. LiteLLM registration uses a local stand-in. They need no
-model credentials or network access.
+and ordered shutdown. Storage tests kill further backend access during a model
+request and cancellation cleanup, then reopen the same SQLite store without a
+prior clean harness shutdown. Model recovery follows the configured retry policy;
+these tests permit one retry, not exactly-once model execution. LiteLLM
+registration uses a local stand-in. They need no model credentials or network access.
 
 The local cancellation-scope diagnostic remains available:
 

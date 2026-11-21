@@ -17,7 +17,7 @@ export const A2ABinding = defineDocFamily({
 });
 const Admission = defineDoc({
   kind: 'a2a.admission', version: 1, ...conversationScope,
-  initial: () => ({ count: 0 }), checkpointWhen: () => true,
+  initial: () => ({}), checkpointWhen: () => true,
 });
 
 async function submissionOutcome(settled, runtime, ctx) {
@@ -96,6 +96,7 @@ function recordState(record) {
 const recordTimestamp = (record) => record.endedAt ?? record.startedAt ?? record.input.acceptedAt;
 
 export function taskView(record) {
+  if (record.version !== 1) throw new UnsupportedOperationError('Unsupported stored A2A task version');
   const contextId = String(record.conversationId);
   const state = recordState(record);
   let text;
@@ -310,7 +311,6 @@ export async function openA2A(options) {
         if (stopping || (active && active.state.status !== 'terminal') || live.run || inbox.items.length) {
           throw new UnsupportedOperationError('Agent busy');
         }
-        if (admission.count >= 10_000) throw new UnsupportedOperationError('Task capacity reached');
         // The observer must stay outside ordinary conversation.abort()/idle waits:
         // its abort handler joins that foreground scope, which otherwise includes itself.
         const id = await tx.createTask(A2ATask, { messageId: m.messageId, text, hash, acceptedAt: Date.now() },
@@ -318,13 +318,17 @@ export async function openA2A(options) {
         binding.taskId = id;
         binding.hash = hash;
         admission.active = id;
-        admission.count += 1;
         return { id, duplicate: false };
       }, context);
       if (stopping) throw new UnsupportedOperationError('Agent stopping');
       if (accepted.duplicate) {
-        if (params.configuration?.returnImmediately !== true) await harness.waitForTask(accepted.id, waitingContext);
-        const task = await store.load(accepted.id);
+        // Validate the stored version before waiting: an older host must not
+        // wait forever on a task whose newer definition it cannot run.
+        let task = await store.load(accepted.id);
+        if (params.configuration?.returnImmediately !== true && !terminal.has(task.status.state)) {
+          await harness.waitForTask(accepted.id, waitingContext);
+          task = await store.load(accepted.id);
+        }
         this._applyHistoryLengthSemantics(task, params.configuration ?? {});
         return task;
       }

@@ -52,9 +52,9 @@ rather than quietly replacing it or using private scheduler tables.
 SDK-specific adaptations should be narrow, justified and regression-tested.
 
 Treat stored names, schemas and request keys as compatibility contracts. Storage
-work means documenting versioning/migration, testing crashes and revisiting our
-artificial lifetime admission cap—not building Durable's pruning or archiving.
-Don't describe hiding records as physical pruning. Keep later roadmap work out
+work means documenting versioning/migration and testing crashes—not building
+Durable's pruning or archiving. Don't add arbitrary lifetime task quotas as a
+retention policy, or describe hiding records as physical pruning. Keep later roadmap work out
 of the current change.
 
 ## Current cancellation constraint
