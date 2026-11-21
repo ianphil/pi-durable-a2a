@@ -5,7 +5,7 @@ import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai/providers/faux';
 import { Harness, MemoryStorage, createRegistry, defineExtension, defineTask } from '@earendil-works/pi-durable';
-import { A2ATask } from '../src/prototype.js';
+import { A2ATask } from '../src/a2a.js';
 
 function gate(text) {
   const started = Promise.withResolvers();

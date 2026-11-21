@@ -1,148 +1,274 @@
-import { execFileSync } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { statfsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
-import { Kysely, SqliteDialect } from 'kysely';
-import { AgentCard, Message, Role, Task, TaskState, TaskStatusUpdateEvent } from '@a2a-js/sdk';
-import {
-  AgentEvent, DefaultExecutionEventBusManager, DefaultRequestHandler, ResultManager, ServerCallContext,
-} from '@a2a-js/sdk/server';
-import { DatabaseTaskStore } from '@a2a-js/sdk/server/database';
-import { ContentTypeNotSupportedError, RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
-import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
-import { AssistantEntry } from '@earendil-works/pi-durable';
+import { createHash } from 'node:crypto';
+import { AgentCard, Message, Role, Task, TaskState } from '@a2a-js/sdk';
+import { AgentEvent, DefaultExecutionEventBusManager, DefaultRequestHandler, RequestContext } from '@a2a-js/sdk/server';
+import { ContentTypeNotSupportedError, RequestMalformedError, TaskNotCancelableError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
+import { BACKGROUND_CONTEXT as context, withAbortSignal } from '@earendil-works/chord/context';
+import { AssistantEntry, defineDoc, defineDocFamily, defineExtension, defineTask, InboxDoc, LiveDoc, SubmissionSettled } from '@earendil-works/pi-durable';
 
-const owner = 'shared-agent';
-const callContext = new ServerCallContext();
+const inputBytes = 16_384;
+const outputBytes = 65_536;
 const terminal = new Set([TaskState.TASK_STATE_COMPLETED, TaskState.TASK_STATE_FAILED, TaskState.TASK_STATE_CANCELED]);
-const limits = { inputBytes: 16_384, outputBytes: 65_536, tasks: 10_000, pages: 262_144, freeBytes: 64 * 1024 * 1024 };
+const conversationScope = { scope: 'conversation', history: 'latest', fork: 'initial' };
 
-// The SDK's task tables are migrated by its own CLI. Run it before opening the store.
-function upgradeTaskStore(database) {
-  const cli = fileURLToPath(new URL('cli/a2a_db.js', import.meta.resolve('@a2a-js/sdk')));
-  execFileSync(process.execPath, [cli, 'upgrade', '--url', `sqlite:${database}`, '--store', 'tasks'], { stdio: 'ignore' });
+export const A2ABinding = defineDocFamily({
+  kind: 'a2a.message', version: 1, family: true, ...conversationScope,
+  initial: () => ({}), checkpointWhen: () => true,
+});
+const Admission = defineDoc({
+  kind: 'a2a.admission', version: 1, ...conversationScope,
+  initial: () => ({ count: 0 }), checkpointWhen: () => true,
+});
+
+async function submissionOutcome(settled, runtime, ctx) {
+  if (settled?.status === 'done' && settled.type === 'input') {
+    const answer = await runtime.entry(AssistantEntry, settled.answer, ctx);
+    const text = answer?.model?.flatMap((m) => m.role === 'assistant'
+      ? m.content.filter((part) => part.type === 'text').map((part) => part.text) : []).join('\n') ?? '';
+    return Buffer.byteLength(text) > outputBytes
+      ? { status: 'failed', error: { message: 'Answer exceeds result limit' } }
+      : { status: 'completed', result: text };
+  }
+  return settled?.reason === 'aborted' ? { status: 'aborted' }
+    : { status: 'failed', error: { message: 'Execution did not produce an answer' } };
+}
+
+export const A2ATask = defineTask({
+  name: 'a2a.task', version: 1,
+  initial: () => ({ phase: 'submit' }),
+  phases: {
+    async submit(task, runtime, ctx) {
+      const conversation = await runtime.conversation(runtime.conversationId, ctx);
+      await runtime.commit(async (tx) => {
+        const submissionId = await conversation.submit(tx, {
+          type: 'input', content: task.input.text, requestId: `a2a:${task.input.messageId}`,
+          whenBusy: 'reject', notify: { taskId: task.id, key: 'answer' },
+        });
+        return { status: 'sleeping', signals: [SubmissionSettled.key('answer')],
+          checkpoint: { phase: 'answer', submissionId } };
+      }, ctx);
+    },
+    async answer(_task, runtime, ctx) {
+      const signal = await runtime.readSignal(SubmissionSettled, 'answer', ctx);
+      const outcome = await submissionOutcome(signal?.value, runtime, ctx);
+      await runtime.commit(() => ({ status: 'terminal', outcome }), ctx);
+    },
+  },
+  async abort(task, runtime, ctx) {
+    const conversation = await runtime.conversation(runtime.conversationId, ctx);
+    // Reacquire by request ID only when submit committed. Never create input just to cancel it.
+    let outcome = { status: 'aborted' };
+    if (task.state.checkpoint.submissionId) {
+      const submission = await conversation.submit({
+        type: 'input', content: task.input.text, requestId: `a2a:${task.input.messageId}`,
+      }, ctx);
+      if (await submission.abort(ctx) === 'already_placed') await conversation.abort(ctx);
+      // Cancellation intent must not replace an answer or failure that already won.
+      // The conversation-wide abort above still requires exclusive A2A foreground
+      // use until Durable exposes submission-scoped cancellation.
+      outcome = await submissionOutcome(await submission.wait(ctx), runtime, ctx);
+    }
+    await runtime.commit(() => ({ status: 'terminal', outcome }), ctx);
+  },
+});
+
+export const A2AExtension = defineExtension({ name: 'a2a', tasks: [A2ATask] });
+
+function recordState(record) {
+  if (record.state.status !== 'terminal') return record.startedAt === undefined
+    ? TaskState.TASK_STATE_SUBMITTED : TaskState.TASK_STATE_WORKING;
+  switch (record.state.outcome.status) {
+    case 'completed': return TaskState.TASK_STATE_COMPLETED;
+    case 'aborted': return TaskState.TASK_STATE_CANCELED;
+    default: return TaskState.TASK_STATE_FAILED;
+  }
+}
+const recordTimestamp = (record) => record.endedAt ?? record.startedAt ?? record.input.acceptedAt;
+
+export function taskView(record) {
+  const contextId = String(record.conversationId);
+  const state = recordState(record);
+  let text;
+  if (record.state.status === 'terminal') {
+    const outcome = record.state.outcome;
+    if (outcome.status === 'completed') text = outcome.result;
+    else if (outcome.status === 'aborted') text = 'Canceled after execution settled';
+    else text = outcome.status === 'failed' ? outcome.error.message : 'Execution unavailable';
+  }
+  const user = { role: 'ROLE_USER', messageId: record.input.messageId, taskId: record.id,
+    contextId, parts: [{ text: record.input.text }] };
+  const message = text === undefined ? undefined : Message.fromJSON({ role: 'ROLE_AGENT',
+    messageId: `${record.id}:answer`, taskId: record.id, contextId, parts: [{ text }] });
+  return Task.fromJSON({ id: record.id, contextId,
+    status: { state, timestamp: new Date(recordTimestamp(record)).toISOString(),
+      ...(message ? { message: Message.toJSON(message) } : {}) },
+    history: [user, ...(message ? [Message.toJSON(message)] : [])],
+  });
+}
+
+export function durableTaskStore(harness, conversation) {
+  const query = { kind: 'a2a.task', conversationId: conversation.id, order: 'descending' };
+  return {
+    async save() {}, // ResultManager may merge transient snapshots, but Durable alone owns persistence.
+    async load(id) {
+      const numericId = Number(id);
+      if (!Number.isSafeInteger(numericId) || numericId < 1 || String(numericId) !== String(id)) return undefined;
+      const record = await harness.getTask(numericId, context);
+      return record?.kind === query.kind && record.conversationId === conversation.id ? taskView(record) : undefined;
+    },
+    async list(params) {
+      let cursor;
+      if (params.pageToken) {
+        try {
+          const token = JSON.parse(Buffer.from(params.pageToken, 'base64url').toString());
+          if (token.conversationId !== conversation.id || token.status !== params.status
+            || token.after !== params.statusTimestampAfter || !token.cursor || typeof token.cursor !== 'object') throw new Error();
+          cursor = token.cursor;
+        } catch { throw new RequestMalformedError('Invalid page token'); }
+      }
+      const after = params.statusTimestampAfter ? Date.parse(params.statusTimestampAfter) : undefined;
+      const matches = (record) => (!params.contextId || String(record.conversationId) === params.contextId)
+        && (!params.status || recordState(record) === params.status)
+        && (after === undefined || recordTimestamp(record) > after);
+      const filtered = params.contextId || params.status || after !== undefined;
+      return harness.commit(async (tx) => {
+        // Count and page from the same committed view. Filters not available in Durable are applied here.
+        let totalSize = 0;
+        let countCursor;
+        do {
+          const page = await tx.scanTasks(query, 100, countCursor);
+          totalSize += filtered ? page.items.filter(matches).length : page.items.length;
+          countCursor = page.next;
+        } while (countCursor);
+        const tasks = [];
+        let next;
+        do {
+          const page = await tx.scanTasks(query, 1, cursor);
+          const record = page.items[0];
+          if (record && matches(record)) {
+            if (tasks.length === params.pageSize) break;
+            tasks.push(taskView(record));
+            next = page.next;
+          }
+          cursor = page.next;
+          if (!cursor) { next = undefined; break; }
+        } while (cursor);
+        const nextPageToken = next ? Buffer.from(JSON.stringify({ conversationId: conversation.id,
+          status: params.status, after: params.statusTimestampAfter, cursor: next })).toString('base64url') : '';
+        return { tasks, nextPageToken, pageSize: params.pageSize, totalSize };
+      }, context);
+    },
+  };
 }
 
 /**
- * Serve one Durable conversation over A2A. The SDK owns protocol, task snapshots and
- * pagination; this bridge maps each accepted message to one Durable submission.
+ * Map A2A onto a host's Durable harness and conversation. Install A2AExtension in
+ * the registry before opening/resuming the harness; no separate A2A store exists.
+ * All foreground work in the served conversation must come through A2A until
+ * Durable supports submission-scoped cancellation.
  *
  * @param {object} options
+ * @param {import('@earendil-works/pi-durable').Harness} options.harness
  * @param {import('@earendil-works/pi-durable').Conversation} options.conversation
- * @param {string} options.database SQLite file for A2A tasks and admissions.
  * @param {{ name: string, description: string, version?: string, url: string,
  *   skills: { id: string, name: string, description: string, tags?: string[] }[] }} options.card
- * @param {(event: string, fields: Record<string, string>) => void} [options.log]
  */
 export async function openA2A(options) {
-  const { conversation } = options;
-  upgradeTaskStore(options.database);
-  const sqlite = new Database(options.database);
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.exec(`CREATE TABLE IF NOT EXISTS a2a_identity (id INTEGER PRIMARY KEY CHECK(id=1), context TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS a2a_admission (task TEXT PRIMARY KEY, message TEXT UNIQUE NOT NULL,
-      hash TEXT NOT NULL, text TEXT NOT NULL, cancel INTEGER NOT NULL DEFAULT 0)`);
-  sqlite.prepare('INSERT OR IGNORE INTO a2a_identity VALUES (1, ?)').run(randomUUID());
-  const contextId = sqlite.prepare('SELECT context FROM a2a_identity').get().context;
-  const admission = (task) => sqlite.prepare('SELECT * FROM a2a_admission WHERE task=?').get(task);
-  const db = new Kysely({ dialect: new SqliteDialect({ database: sqlite }) });
-  const store = new DatabaseTaskStore(db, { ownerResolver: () => owner });
-  const buses = new DefaultExecutionEventBusManager(() => owner);
-  const active = new Map();
+  if ('database' in options) throw new TypeError('The database option was removed; A2A uses the host Durable store');
+  const { harness, conversation, card: description } = options;
+  if (!harness || !conversation || !description) throw new TypeError('openA2A requires harness, conversation and card');
+  const contextId = String(conversation.id);
+  const store = durableTaskStore(harness, conversation);
+  const buses = new DefaultExecutionEventBusManager(() => 'shared-agent');
+  const waitingBuses = new Set();
+  const drains = new Set();
+  const requests = new Set();
+  const executions = new Set();
+  const stopWaiting = new AbortController();
+  const waitingContext = withAbortSignal(stopWaiting.signal, context);
   let stopping = false;
-  let admitting = false;
-
+  let closing;
+  const trackRequest = (work) => {
+    if (stopping) return Promise.reject(new UnsupportedOperationError('Agent stopping'));
+    const request = Promise.resolve().then(work);
+    requests.add(request);
+    return request.finally(() => requests.delete(request));
+  };
   const card = AgentCard.fromJSON({
-    name: options.card.name, description: options.card.description, version: options.card.version ?? '0.1.0',
-    supportedInterfaces: [{ url: options.card.url, protocolBinding: 'JSONRPC', protocolVersion: '1.0' }],
+    name: description.name, description: description.description, version: description.version ?? '0.1.0',
+    supportedInterfaces: [{ url: description.url, protocolBinding: 'JSONRPC', protocolVersion: '1.0' }],
     capabilities: { streaming: false, pushNotifications: false, extendedAgentCard: false },
     defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
     securitySchemes: { bearer: { httpAuthSecurityScheme: { scheme: 'Bearer' } } },
-    securityRequirements: [{ schemes: { bearer: { list: [] } } }],
-    skills: options.card.skills,
+    securityRequirements: [{ schemes: { bearer: { list: [] } } }], skills: description.skills,
   });
-
-  const publish = async (bus, id, state, text) => {
-    const message = Message.fromJSON({ role: 'ROLE_AGENT', messageId: randomUUID(), taskId: id, contextId, parts: [{ text }] });
-    const event = AgentEvent.statusUpdate(TaskStatusUpdateEvent.fromJSON({ taskId: id, contextId,
-      status: { state, timestamp: new Date().toISOString(), message: Message.toJSON(message) } }));
-    await new ResultManager(store, callContext).processEvent(event);
-    options.log?.('a2a_settled', { taskId: id, contextId, state: String(state) });
-    bus.publish(event);
+  const execute = async (request, bus) => {
+    waitingBuses.add(bus);
+    try {
+      if (stopping) return;
+      const initial = await store.load(request.taskId);
+      if (stopping) return;
+      bus.publish(AgentEvent.task(initial));
+      await harness.waitForTask(Number(request.taskId), waitingContext);
+      if (!stopping) bus.publish(AgentEvent.task(await store.load(request.taskId)));
+    } catch (error) {
+      if (!stopping) throw error;
+    } finally { waitingBuses.delete(bus); }
   };
-
-  // A request ID makes Durable return the same submission after a restart or a cancel.
-  const submit = (row) => conversation.submit(
-    { type: 'input', content: row.text, requestId: `a2a:${row.message}`, whenBusy: 'reject' }, context);
-
-  const run = (row, bus) => {
-    const existing = active.get(row.task);
-    if (existing) return existing;
-    const work = (async () => {
-      const task = await store.load(row.task, callContext) ?? Task.fromJSON({ id: row.task, contextId,
-        status: { state: 'TASK_STATE_WORKING', timestamp: new Date().toISOString() } });
-      await new ResultManager(store, callContext).processEvent(AgentEvent.task(task));
-      bus.publish(AgentEvent.task(task));
-      const submission = await submit(row);
-      options.log?.('a2a_submission', { taskId: row.task, contextId, submissionId: String(submission.id) });
-      if (row.cancel) await abort(submission);
-      const settled = await submission.wait(context);
-      if (settled.status === 'done' && settled.type === 'input') {
-        const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
-        const text = answer?.model?.flatMap((m) => m.role === 'assistant'
-          ? m.content.filter((part) => part.type === 'text').map((part) => part.text) : []).join('\n') ?? '';
-        if (Buffer.byteLength(text) > limits.outputBytes) await publish(bus, row.task, TaskState.TASK_STATE_FAILED, 'Answer exceeds result limit');
-        else await publish(bus, row.task, TaskState.TASK_STATE_COMPLETED, text);
-      } else if (admission(row.task).cancel) {
-        await publish(bus, row.task, TaskState.TASK_STATE_CANCELED, 'Canceled after execution settled');
-      } else {
-        await publish(bus, row.task, TaskState.TASK_STATE_FAILED, 'Execution did not produce an answer');
-      }
-    })().catch(async () => {
-      // While stopping, accepted work stays pending in Durable and resumes on the next open.
-      if (!stopping) await publish(bus, row.task, TaskState.TASK_STATE_FAILED, 'Execution unavailable');
-    }).finally(() => { active.delete(row.task); if (!stopping) bus.finished(); });
-    active.set(row.task, work);
-    return work;
-  };
-
-  const abort = async (submission) => {
-    if (await submission.abort(context) === 'already_placed') await conversation.abort(context);
-  };
-
   const executor = {
-    async execute(requestContext, bus) {
-      const row = admission(requestContext.taskId);
-      if (!row) throw new Error('admission_missing');
-      await run(row, bus);
+    execute(request, bus) {
+      const execution = execute(request, bus);
+      executions.add(execution);
+      return execution.finally(() => executions.delete(execution));
     },
     async cancelTask(id) {
-      sqlite.prepare('UPDATE a2a_admission SET cancel=1 WHERE task=?').run(id);
-      await abort(await submit(admission(id)));
-      await active.get(id);
+      await harness.abortTask(Number(id), context);
+      await harness.waitForTask(Number(id), context);
     },
   };
-
   const validateScope = (tenant, requestedContext) => {
     if (tenant || (requestedContext && requestedContext !== contextId)) throw new RequestMalformedError('Unknown scope');
   };
-
   class Handler extends DefaultRequestHandler {
+    async _processEvents(...args) {
+      const drain = super._processEvents(...args);
+      drains.add(drain);
+      try { return await drain; } finally { drains.delete(drain); }
+    }
     async *sendMessageStream() { throw new UnsupportedOperationError('Streaming unsupported'); }
     async *resubscribe() { throw new UnsupportedOperationError('Streaming unsupported'); }
-    async getTask(params, ctx) { validateScope(params.tenant); return super.getTask(params, ctx); }
-    async listTasks(params, ctx) {
-      validateScope(params.tenant, params.contextId);
-      if ((params.pageSize ?? 0) < 0 || (params.pageSize ?? 0) > 100) throw new RequestMalformedError('Invalid page size');
-      return super.listTasks({ ...params, pageSize: params.pageSize || 50 }, ctx);
+    getTask(params, ctx) {
+      return trackRequest(() => { validateScope(params.tenant); return super.getTask(params, ctx); });
     }
-    async cancelTask(params, ctx) {
+    listTasks(params, ctx) {
+      return trackRequest(() => {
+        validateScope(params.tenant, params.contextId);
+        if ((params.pageSize ?? 0) < 0 || (params.pageSize ?? 0) > 100) throw new RequestMalformedError('Invalid page size');
+        return super.listTasks({ ...params, pageSize: params.pageSize || 50 }, ctx);
+      });
+    }
+    cancelTask(params, ctx) { return trackRequest(() => this._cancelTask(params, ctx)); }
+    async _cancelTask(params, ctx) {
       validateScope(params.tenant);
-      if (stopping) throw new UnsupportedOperationError('Agent stopping');
-      return super.cancelTask(params, ctx);
+      const task = await super.getTask(params, ctx);
+      if (task.status.state === TaskState.TASK_STATE_CANCELED) return task;
+      if (terminal.has(task.status.state)) throw new TaskNotCancelableError();
+      // SDK's no-bus path only changes its snapshot; it does not invoke cancellation.
+      await executor.cancelTask(params.id);
+      const latest = await super.getTask(params, ctx);
+      if (latest.status.state !== TaskState.TASK_STATE_CANCELED) throw new TaskNotCancelableError();
+      return latest;
     }
-    async sendMessage(params, ctx) {
+    async _createRequestContext(params, ctx) {
+      // This is a newly admitted task, not a continuation. Let the SDK validate its
+      // request normally, without its continuation-only terminal-state rejection.
+      const validated = await super._createRequestContext({ ...params, message: { ...params.message, taskId: '' } }, ctx);
+      const message = { ...validated.userMessage, taskId: params.message.taskId };
+      const task = await store.load(message.taskId);
+      if (stopping) throw new UnsupportedOperationError('Agent stopping');
+      return new RequestContext({ ...validated.request, message }, message.taskId, contextId, ctx, task);
+    }
+    sendMessage(params, ctx) { return trackRequest(() => this._sendMessage(params, ctx)); }
+    async _sendMessage(params, ctx) {
       validateScope(params.tenant);
       const modes = params.configuration?.acceptedOutputModes;
       if (modes?.length && !modes.some((mode) => ['text/plain', 'text/*', '*/*'].includes(mode))) throw new ContentTypeNotSupportedError();
@@ -153,46 +279,57 @@ export async function openA2A(options) {
       if (m.parts.some((p) => p.content?.$case !== 'text' || (p.mediaType && p.mediaType !== 'text/plain'))) throw new ContentTypeNotSupportedError();
       if (m.taskId || m.referenceTaskIds.length || params.configuration?.taskPushNotificationConfig) throw new UnsupportedOperationError();
       const text = m.parts.map((p) => p.content?.value).join('\n');
-      if (m.messageId.length > 128 || !text.trim() || Buffer.byteLength(text) > limits.inputBytes) throw new RequestMalformedError('Input too large');
+      if (m.messageId.length > 128 || !text.trim() || Buffer.byteLength(text) > inputBytes) throw new RequestMalformedError('Input too large');
       const hash = createHash('sha256').update(text).digest('hex');
-      const previous = sqlite.prepare('SELECT * FROM a2a_admission WHERE message=?').get(m.messageId);
-      if (previous) {
-        if (previous.hash !== hash) throw new RequestMalformedError('Message ID conflict');
-        const snapshot = await store.load(previous.task, ctx);
-        if (!snapshot) throw new UnsupportedOperationError('Task recovering');
-        return snapshot;
+      const accepted = await conversation.commit(async (tx) => {
+        const binding = await tx.doc(A2ABinding, conversation.id, m.messageId, null);
+        if (binding.taskId) {
+          if (binding.hash !== hash) throw new RequestMalformedError('Message ID conflict');
+          return { id: binding.taskId, duplicate: true };
+        }
+        const admission = await tx.doc(Admission, conversation.id);
+        const active = admission.active && await tx.task(admission.active);
+        const live = await tx.doc(LiveDoc, conversation.id);
+        const inbox = await tx.doc(InboxDoc, conversation.id);
+        if (stopping || (active && active.state.status !== 'terminal') || live.run || inbox.items.length) {
+          throw new UnsupportedOperationError('Agent busy');
+        }
+        if (admission.count >= 10_000) throw new UnsupportedOperationError('Task capacity reached');
+        // The observer must stay outside ordinary conversation.abort()/idle waits:
+        // its abort handler joins that foreground scope, which otherwise includes itself.
+        const id = await tx.createTask(A2ATask, { messageId: m.messageId, text, hash, acceptedAt: Date.now() },
+          { ownership: { kind: 'conversation' }, background: true });
+        binding.taskId = id;
+        binding.hash = hash;
+        admission.active = id;
+        admission.count += 1;
+        return { id, duplicate: false };
+      }, context);
+      if (stopping) throw new UnsupportedOperationError('Agent stopping');
+      if (accepted.duplicate) {
+        if (params.configuration?.returnImmediately !== true) await harness.waitForTask(accepted.id, waitingContext);
+        const task = await store.load(accepted.id);
+        this._applyHistoryLengthSemantics(task, params.configuration ?? {});
+        return task;
       }
-      if (stopping || admitting || active.size) throw new UnsupportedOperationError('Agent busy');
-      if (sqlite.prepare('SELECT count(*) AS n FROM a2a_admission').get().n >= limits.tasks) throw new UnsupportedOperationError('Task capacity reached');
-      const disk = statfsSync(options.database);
-      if (disk.bavail * disk.bsize < limits.freeBytes || sqlite.pragma('page_count', { simple: true }) > limits.pages) {
-        throw new UnsupportedOperationError('Storage capacity reached');
-      }
-      admitting = true;
-      const id = randomUUID();
-      try {
-        sqlite.prepare('INSERT INTO a2a_admission(task,message,hash,text) VALUES(?,?,?,?)').run(id, m.messageId, hash, text);
-        await store.save(Task.fromJSON({ id, contextId, status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() } }), ctx);
-        return await super.sendMessage({ ...params, message: { ...m, taskId: id, contextId } }, ctx);
-      } finally { admitting = false; }
+      return super.sendMessage({ ...params, message: { ...m, taskId: accepted.id, contextId } }, ctx);
     }
   }
-  const handler = new Handler(card, store, executor, buses);
-
-  // Recreate live buses before serving: the SDK's no-bus cancel path would otherwise
-  // mark a recovered task canceled without stopping its Durable work.
-  for (const row of sqlite.prepare('SELECT * FROM a2a_admission').all()) {
-    const snapshot = await store.load(row.task, callContext);
-    if (!snapshot || !terminal.has(snapshot.status.state)) void run(row, buses.createOrGetByTaskId(row.task, callContext));
-  }
-
-  return {
-    handler, card, contextId,
-    /** Stop admitting work. Close the Durable harness afterwards; pending work resumes on the next open. */
-    async close() {
-      stopping = true;
-      while (admitting) await new Promise((resolve) => setTimeout(resolve, 10));
-      await db.destroy();
+  return { handler: new Handler(card, store, executor, buses), card, contextId, store,
+    close() {
+      if (!closing) {
+        stopping = true;
+        stopWaiting.abort(); // Cancel only request-side waits, never Durable execution.
+        for (const bus of waitingBuses) bus.finished();
+        closing = (async () => {
+          // Accepted cancellations finish under a usable harness, including their
+          // final reads. Pending sends stop waiting, but their Durable work stays.
+          await Promise.allSettled([...requests]);
+          await Promise.allSettled([...drains]);
+          await Promise.allSettled([...executions]);
+        })();
+      }
+      return closing;
     },
   };
 }
