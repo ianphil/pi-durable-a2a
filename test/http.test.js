@@ -7,6 +7,8 @@ import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/provid
 import { createRegistry, Harness, MemoryStorage } from '@earendil-works/pi-durable';
 import { A2AExtension, createA2AHttpHandler, createA2AServer, openA2A } from 'pi-durable-a2a';
 import { liteLLMTaskHandler } from 'pi-durable-a2a/litellm';
+import { ClientFactory, JsonRpcTransportFactory } from '@a2a-js/sdk/client';
+import { runGatewaySmoke } from '../scripts/gateway-smoke.js';
 
 const token = 'a'.repeat(40);
 
@@ -141,5 +143,41 @@ test('LiteLLM forwarding is opt-in and uses SDK task compatibility', { timeout: 
         assert.equal(after.status.state, 'canceled');
       } finally { release.resolve(); }
     }, { mounted, compatibility: true });
+  });
+});
+
+test('parameterised smoke exercises the SDK against real Durable execution', { timeout: 5000 }, async () => {
+  await listener(async ({ base, a2a, faux }) => {
+    const fetchImpl = (input, init) => fetch(input, { ...init,
+      headers: { ...init?.headers, authorization: `Bearer ${token}` } });
+    const client = await new ClientFactory({ transports: [new JsonRpcTransportFactory({ fetchImpl })] })
+      .createFromAgentCard({ ...a2a.card,
+        supportedInterfaces: a2a.card.supportedInterfaces.map((entry) => ({ ...entry, url: `${base}/a2a` })),
+      });
+    const complete = Promise.withResolvers();
+    const cancel = Promise.withResolvers();
+    const echoMarker = (transcript) => fauxAssistantMessage(JSON.stringify(transcript.messages).match(/smoke-[0-9a-f-]+-marker/)[0]);
+    faux.setResponses([echoMarker, echoMarker,
+      async () => { await complete.promise; return fauxAssistantMessage('Read-only report'); },
+      async (_transcript, options) => {
+        const abort = () => cancel.resolve();
+        options.signal.addEventListener('abort', abort, { once: true });
+        if (options.signal.aborted) abort();
+        try { await cancel.promise; return fauxAssistantMessage('Must not become an answer'); }
+        finally { options.signal.removeEventListener('abort', abort); }
+      },
+    ]);
+    const checks = [];
+    try {
+      const result = await runGatewaySmoke(client, { slowPrompt: 'Read a large collection of issues.', pollMs: 10,
+        report: (event) => {
+          checks.push(event.check);
+          if (event.check === 'working/busy') complete.resolve();
+        },
+      });
+      assert.ok(result.firstTaskId);
+      assert.deepEqual(checks, ['send/get', 'idempotency/conflicting-text', 'follow-up', 'paginated-list',
+        'started', 'working/busy', 'polled-completed', 'canceled/stable-get']);
+    } finally { complete.resolve(); cancel.resolve(); }
   });
 });

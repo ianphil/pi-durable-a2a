@@ -259,6 +259,36 @@ native-only serving, mounting beside host routes, and explicitly enabled LiteLLM
 get/list/cancel forwarding, including authentication and body limits. LiteLLM
 registration uses a local stand-in. They need no model credentials or network access.
 
+### Read-only live SDK smoke
+
+With a reachable, already registered agent and an operator-supplied messaging
+key, run from this checkout:
+
+```sh
+export A2A_URL='<agent URL>'
+export A2A_TOKEN_FILE='<private messaging-key file>'
+export A2A_SLOW_PROMPT='<slow read-only request appropriate for this agent>'
+node scripts/gateway-smoke.js
+```
+
+The official SDK performs discovery and all task operations. The script checks
+send/get, message-ID retries and conflicting text, a follow-up that recalls a
+random marker, paginated list, start/working/completion, busy rejection and
+cancellation followed by a stable canceled read. It emits step names and task
+IDs, not credentials or full answers. On failure it attempts to cancel only work
+it started and reports any cleanup failure.
+
+Choose a read-only slow request long enough to observe working and cancel a
+second run; a task finishing before these checks is not evidence of broken
+cancellation. Prompts are not a sandbox or an authorization policy. This script
+does not register/deregister agents, change gateway grants, deploy services or
+claim crash recovery. Fleet-specific prompts, restart/crash commands, the real
+Pi client workflow and evidence belong in the private deployment runbook.
+
+The local test exercises this script's flow with a real SDK client and Durable
+harness using explicitly gated scripted models. It does not contact a gateway
+or need model credentials. Passing it is not proof of a deployed gateway.
+
 The local cancellation-scope diagnostic remains available:
 
 ```sh
