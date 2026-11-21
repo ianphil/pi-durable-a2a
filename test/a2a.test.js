@@ -156,12 +156,12 @@ test('serves a Durable conversation through the official A2A SDK across restarts
     const restored = await running.client.getTask(GetTaskRequest.fromJSON({ id: first.id }));
     assert.match(JSON.stringify(restored.status), /Persistent hello/);
 
-    // LiteLLM sends v0.3 task controls to the registered base URL.
-    const legacy = await fetch(`${running.base}/`, {
+    // The core listener has no LiteLLM compatibility route by default.
+    const root = await fetch(`${running.base}/`, {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: first.id } }),
     });
-    assert.equal((await legacy.json()).result.id, first.id);
+    assert.equal(root.status, 404);
 
     // A failed model request fails the task without exposing the provider's error text.
     faux.setResponses([fauxAssistantMessage('', { stopReason: 'error', errorMessage: 'PROVIDER_PRIVATE' })]);

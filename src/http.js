@@ -2,39 +2,28 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { AgentCard } from '@a2a-js/sdk';
 import { JsonRpcTransportHandler, ServerCallContext } from '@a2a-js/sdk/server';
-import { LegacyJsonRpcTransportHandler } from '@a2a-js/sdk/compat/v0_3/server';
 
 const maxBodyBytes = 32_768;
 
-// Deployed LiteLLM forwards task controls to the registered base URL with v0.3 method
-// names. Remove once native get/list/cancel pass through the gateway:
-// https://github.com/BerriAI/litellm/pull/44769
-function gatewayTaskTransport(handler) {
-  const native = new JsonRpcTransportHandler(handler);
-  const legacy = new LegacyJsonRpcTransportHandler(handler);
-  return async (text, call) => {
-    let body;
-    try { body = JSON.parse(text); } catch { return native.handle(text, call); }
-    if (body?.method === 'tasks/list') return native.handle({ ...body, method: 'ListTasks' }, call);
-    if (body?.method === 'tasks/get' || body?.method === 'tasks/cancel') return legacy.handle(body, call);
-    return native.handle(text, call);
-  };
-}
-
 /**
- * HTTP listener for an `openA2A` bridge: bearer-authenticated Agent Card, JSON-RPC at
- * `/a2a`, the gateway task adapter at `/`, and unauthenticated health checks.
- * The caller chooses where it listens and closes the bridge afterwards.
+ * Node HTTP callback a host can mount in its server. Serves native JSON-RPC at
+ * `/a2a`, the authenticated Agent Card and unauthenticated `/health`.
+ * Additional POST paths use SDK-style `(text, call) => result` transports, behind
+ * the same authentication and body limits. `/a2a` always uses the native SDK.
  *
  * @param {Awaited<ReturnType<typeof import('./a2a.js').openA2A>>} bridge
- * @param {{ token: string }} options Listener bearer token, 32 or more base64url characters.
+ * @param {{ token: string, extraRoutes?: Record<string, (text: string,
+ *   call: ServerCallContext) => Promise<object>> }} options
+ *   Listener token: 32 or more base64url characters.
+ * @returns {import('node:http').RequestListener}
  */
-export function createA2AServer(bridge, { token }) {
+export function createA2AHttpHandler(bridge, { token, extraRoutes = {} }) {
   if (!/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new Error('listener_token_invalid');
   const expected = Buffer.from(`Bearer ${token}`);
   const native = new JsonRpcTransportHandler(bridge.handler);
-  const gateway = gatewayTaskTransport(bridge.handler);
-  const server = createServer(async (req, res) => {
+  const routes = new Map(Object.entries(extraRoutes));
+  routes.set('/a2a', (text, call) => native.handle(text, call));
+  return async (req, res) => {
     const json = (status, value) => {
       res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       res.end(JSON.stringify(value));
@@ -43,7 +32,8 @@ export function createA2AServer(bridge, { token }) {
     const supplied = Buffer.from(req.headers.authorization ?? '');
     if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) { req.resume(); return json(401, { error: 'Unauthorized' }); }
     if (req.method === 'GET' && req.url === '/.well-known/agent-card.json') return json(200, AgentCard.toJSON(bridge.card));
-    if (req.method !== 'POST' || !['/a2a', '/'].includes(req.url ?? '')) { req.resume(); return json(404, { error: 'Not found' }); }
+    const transport = routes.get(req.url ?? '');
+    if (req.method !== 'POST' || !transport) { req.resume(); return json(404, { error: 'Not found' }); }
     if (!/^application\/(?:a2a\+)?json(?:;|$)/i.test(req.headers['content-type'] ?? '')) { req.resume(); return json(415, { error: 'Content type' }); }
     try {
       const chunks = [];
@@ -56,13 +46,18 @@ export function createA2AServer(bridge, { token }) {
       const text = Buffer.concat(chunks).toString('utf8');
       const version = req.headers['a2a-version'];
       const call = new ServerCallContext({ requestedVersion: typeof version === 'string' ? version : '' });
-      const result = req.url === '/' ? await gateway(text, call) : await native.handle(text, call);
+      const result = await transport(text, call);
       if (Symbol.asyncIterator in result) return json(400, { error: 'Streaming unsupported' });
       if (!res.destroyed) json(200, result);
     } catch {
       if (!res.destroyed) json(500, { error: 'Request failed' });
     }
-  });
+  };
+}
+
+/** Convenience server; hosts can instead mount `createA2AHttpHandler` themselves. */
+export function createA2AServer(bridge, options) {
+  const server = createServer(createA2AHttpHandler(bridge, options));
   server.requestTimeout = 10_000;
   server.headersTimeout = 5_000;
   return server;

@@ -238,7 +238,18 @@ including future migration policy and refusal of unknown task versions. Its
 killable-storage tests interrupt a model attempt and cancellation cleanup without
 saving clean-harness-shutdown checkpoints, then verify one task/admission and
 stable terminal outcomes across reopen. Model retries remain Durable policy,
-not an exactly-once promise. Authentication, identity-based conversation
-selection, optional gateway routes, consumer deployment and release changes
-remain in #4–#9. This experiment uses local scripted models only; no fleet access or
-GitHub writes are involved.
+not an exactly-once promise.
+
+#4/#5's custom caller-policy hooks are deferred: the core exposes a host-supplied,
+persistent conversation, without another identity/context routing framework.
+#6 extracts the existing Node callback as `createA2AHttpHandler`, while retaining
+`createA2AServer` as a convenience. Native A2A uses the SDK; Express hosts can
+already use the SDK's mounting adapters directly. LiteLLM's existing compatibility
+transport is now `liteLLMTaskHandler` in the optional module, explicitly attached
+as an extra POST route. Its route uses the same listener authentication/body
+limits; core no longer serves a compatibility root by default. HTTP regressions
+cover native-only serving, host-server mounting and opted-in task forwarding.
+No general router or gateway framework is introduced.
+
+Consumer deployment and release changes remain in #7–#9. Tests use local scripted
+models only; no fleet access or GitHub writes are involved.

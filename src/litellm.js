@@ -1,4 +1,28 @@
 import { mkdir, readFile, rmdir } from 'node:fs/promises';
+import { JsonRpcTransportHandler } from '@a2a-js/sdk/server';
+import { LegacyJsonRpcTransportHandler } from '@a2a-js/sdk/compat/v0_3/server';
+
+/**
+ * Optional transport for LiteLLM's POST `/` task forwarding. Mount via
+ * `extraRoutes: { '/': liteLLMTaskHandler(a2a.handler) }` on the Node HTTP helper.
+ * Remove once native task operations pass through the deployed gateway:
+ * https://github.com/BerriAI/litellm/pull/44769
+ *
+ * @param {import('@a2a-js/sdk/server').A2ARequestHandler} handler
+ */
+export function liteLLMTaskHandler(handler) {
+  const native = new JsonRpcTransportHandler(handler);
+  const legacy = new LegacyJsonRpcTransportHandler(handler);
+  return async (text, call) => {
+    let body;
+    try { body = JSON.parse(text); } catch { return native.handle(text, call); }
+    // tasks/list is LiteLLM's alias for the native list operation, not an A2A
+    // v0.3 method. The SDK compatibility handler owns the actual v0.3 methods.
+    if (body?.method === 'tasks/list') return native.handle({ ...body, method: 'ListTasks' }, call);
+    if (body?.method === 'tasks/get' || body?.method === 'tasks/cancel') return legacy.handle(body, call);
+    return native.handle(text, call);
+  };
+}
 
 /**
  * Publish an agent in the LiteLLM A2A registry and grant a team discovery access.
