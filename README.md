@@ -87,7 +87,34 @@ The listener serves:
 | `GET /health` | Unauthenticated liveness |
 | `GET /.well-known/agent-card.json` | Agent Card, bearer token required |
 | `POST /a2a` | Native JSON-RPC (`SendMessage`, `GetTask`, `ListTasks`, `CancelTask`) |
-| `POST /` | LiteLLM's task forwarding, which uses v0.3 method names (see below) |
+
+`POST /` is not served by default. It can be added explicitly for LiteLLM task
+forwarding through the optional module below.
+
+### Mount in a host's Node server
+
+Use the same callback as the convenience server, without another HTTP framework:
+
+```js
+import { createServer } from 'node:http';
+import { createA2AHttpHandler } from 'pi-durable-a2a';
+
+const a2aHttp = createA2AHttpHandler(a2a, { token });
+const server = createServer((req, res) => {
+  if (req.url === '/other') { res.end('Host-owned endpoint'); return; }
+  return a2aHttp(req, res);
+});
+server.listen(8766, '127.0.0.1');
+```
+
+These are alternatives to the server creation in the first example. The host
+chooses which requests to delegate and configures its server timeouts. The
+convenience server keeps its 10-second request and 5-second header timeouts.
+Neither form closes the Durable harness; use the same ordered shutdown above.
+
+Express hosts can already mount the SDK's `jsonRpcHandler` and `agentCardHandler`
+against `a2a.handler`, with their existing authentication/user builder. This
+package does not duplicate those adapters or require Express.
 
 ## Semantics
 
@@ -143,8 +170,8 @@ uses the request ID in the task's committed submission record.
 
 Stop the old listener and settle pending work before upgrading. Archive its A2A
 store if you need its task history. New admissions and all new task state use
-only Durable. The task/document naming and retention contracts are still being
-finalized; this is an early API, not a compatibility-preserving release.
+only Durable. Version-1 identifiers and upgrade policy are in the storage
+contract. This is an early API; the former separate-database API is not preserved.
 
 ## Publish through LiteLLM
 
@@ -182,12 +209,38 @@ a model-callable tool or with the key inside the agent's reach.
 
 ### LiteLLM task forwarding
 
-LiteLLM 1.106.6 forwards `GetTask`, `ListTasks` and `CancelTask` to the registered
-base URL as v0.3 `tasks/get`, `tasks/list` and `tasks/cancel`, without the version
-header. `POST /` translates those through the SDK's compatibility handler. Remove
-it once native task operations pass through the deployed gateway
-([BerriAI/litellm#44769](https://github.com/BerriAI/litellm/pull/44769)). This route
-is unchanged here; making it opt-in belongs to #6.
+LiteLLM 1.106.6 forwards task controls to the registered base URL without the
+version header. Add the compatibility transport explicitly when needed:
+
+```js
+import { createA2AServer } from 'pi-durable-a2a';
+import { liteLLMTaskHandler } from 'pi-durable-a2a/litellm';
+
+const server = createA2AServer(a2a, {
+  token,
+  extraRoutes: { '/': liteLLMTaskHandler(a2a.handler) },
+});
+```
+
+The same `extraRoutes` option works with `createA2AHttpHandler` for a host-owned
+Node server. It maps additional POST paths to SDK-style `(text, call) => result`
+transports. Authentication and the 32 KiB body limit still apply to each route;
+`/a2a` always uses the native SDK transport.
+
+The optional module delegates v0.3 `tasks/get` and `tasks/cancel` to the SDK's
+compatibility handler. `tasks/list` is LiteLLM's alias for native `ListTasks`, not
+an A2A v0.3 method. Native requests on the extra path keep the existing fallback
+to the SDK's native handler. This is gateway forwarding compatibility, not a
+second protocol implementation or a general gateway framework.
+
+**Upgrading an existing LiteLLM listener requires enabling this route.** Without
+it, forwarded task controls to `POST /` return 404. Registration remains a
+separate operator step; attaching the route does not register an agent or read
+an administrative key.
+
+Remove the compatibility route once native task operations work through the
+deployed gateway without it
+([BerriAI/litellm#44769](https://github.com/BerriAI/litellm/pull/44769)).
 
 ## Development
 
@@ -201,7 +254,9 @@ official SDK client, including restart, concurrent admission, late cancellation
 and ordered shutdown. Storage tests kill further backend access during a model
 request and cancellation cleanup, then reopen the same SQLite store without a
 prior clean harness shutdown. Model recovery follows the configured retry policy;
-these tests permit one retry, not exactly-once model execution. LiteLLM
+these tests permit one retry, not exactly-once model execution. HTTP tests cover
+native-only serving, mounting beside host routes, and explicitly enabled LiteLLM
+get/list/cancel forwarding, including authentication and body limits. LiteLLM
 registration uses a local stand-in. They need no model credentials or network access.
 
 The local cancellation-scope diagnostic remains available:
