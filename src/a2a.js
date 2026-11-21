@@ -40,7 +40,9 @@ export const A2ATask = defineTask({
       const conversation = await runtime.conversation(runtime.conversationId, ctx);
       await runtime.commit(async (tx) => {
         const submissionId = await conversation.submit(tx, {
-          type: 'input', content: task.input.text, requestId: `a2a:${task.input.messageId}`,
+          // Message IDs bind to tasks; the task ID separately identifies this
+          // submission so legacy bridge request IDs cannot be adopted accidentally.
+          type: 'input', content: task.input.text, requestId: `a2a.task:${task.id}`,
           whenBusy: 'reject', notify: { taskId: task.id, key: 'answer' },
         });
         return { status: 'sleeping', signals: [SubmissionSettled.key('answer')],
@@ -58,8 +60,16 @@ export const A2ATask = defineTask({
     // Reacquire by request ID only when submit committed. Never create input just to cancel it.
     let outcome = { status: 'aborted' };
     if (task.state.checkpoint.submissionId) {
+      let requestId;
+      await runtime.commit(async (tx) => {
+        const record = await tx.submission(task.state.checkpoint.submissionId);
+        if (!record?.requestId || record.conversationId !== runtime.conversationId) throw new Error('Submission unavailable');
+        requestId = record.requestId;
+      }, ctx);
+      // Use the exact ID committed with this task's submission, including for
+      // older prototype checkpoints. Never derive a different ID and create input.
       const submission = await conversation.submit({
-        type: 'input', content: task.input.text, requestId: `a2a:${task.input.messageId}`,
+        type: 'input', content: task.input.text, requestId,
       }, ctx);
       if (await submission.abort(ctx) === 'already_placed') await conversation.abort(ctx);
       // Cancellation intent must not replace an answer or failure that already won.
@@ -139,6 +149,7 @@ export function durableTaskStore(harness, conversation) {
           totalSize += filtered ? page.items.filter(matches).length : page.items.length;
           countCursor = page.next;
         } while (countCursor);
+        if (totalSize === 0) return { tasks: [], nextPageToken: '', pageSize: params.pageSize, totalSize };
         const tasks = [];
         let next;
         do {

@@ -116,7 +116,8 @@ The listener serves:
   notifications or artifacts.
 - **Listing uses Durable cursors.** Newest task IDs come first. Status/timestamp
   filters and exact totals currently scan records; only returned tasks are
-  translated into SDK snapshots. Scan-only listing does not write a storage commit.
+  translated into SDK snapshots. Zero matches return immediately after the count
+  pass. Scan-only listing does not write a storage commit.
 - **Capacity is currently a lifetime cap.** Each served conversation accepts at
   most 10,000 tasks. Retention/pruning and its idempotency window are not yet
   implemented; see [#3](https://github.com/ianphil/pi-durable-a2a/issues/3).
@@ -132,7 +133,10 @@ unencrypted: use it only on a private network such as a tailnet.
 `openA2A` now requires `{ harness, conversation, card }` and a host-installed
 `A2AExtension`. The old `database` option is rejected. There is no automatic
 migration of old A2A task IDs, contexts or admissions from `a2a.sqlite`; an
-existing Durable conversation's transcript is not replaced.
+existing Durable conversation's transcript is not replaced. New submissions use
+Durable-task-ID request keys, not the former message-ID keys, so an old submission
+without the new task's notification cannot be accidentally adopted. Cancellation
+uses the request ID in the task's committed submission record.
 
 Stop the old listener and settle pending work before upgrading. Archive its A2A
 store if you need its task history. New admissions and all new task state use

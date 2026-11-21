@@ -45,7 +45,10 @@ on the commit line. The binding and task are created in one commit; rejected or
 rolled-back admission creates neither. Concurrent identical IDs find one task;
 competing new IDs cannot both take the slot. The task submits in its own next
 commit and parks on Durable's built-in `SubmissionSettled` signal. Submission
-creation and the parked checkpoint commit together.
+creation and the parked checkpoint commit together. New submissions use the
+request ID `a2a.task:<Durable task ID>`, independent of the caller's message ID.
+This prevents adoption of old bridge submissions keyed as `a2a:<message ID>`
+which lack the observer's settlement notification.
 
 The A2A task is a **background observer**, not the owner of the foreground
 `pi.generation` task. This is necessary with the current conversation APIs: its
@@ -61,7 +64,8 @@ Do not use a background-inclusive conversation abort from the observer's own
 abort handler.
 
 Cancellation before submission creates no input. Once submitted, the handler
-reacquires that submission by its request ID, withdraws it if queued, or aborts
+reads the request ID from its committed submission record and reacquires that
+exact submission, withdraws it if queued, or aborts
 and joins the foreground scope if placed. It then maps the actual settled
 submission through the same outcome logic as the normal answer phase. If an
 answer or failure won before cancellation, that outcome is preserved instead of
@@ -216,7 +220,14 @@ drains/executor readers, then returns so the host can close Durable. It is
 idempotent. A deterministic regression pauses cancellation at its first task
 read and again at its final read after cleanup: close must wait at both points.
 A storage-instrumented regression also verifies that scan-only listing produces
-no storage commits.
+no storage commits. If the batched count finds zero matches, listing returns an
+empty page immediately instead of making a second per-record scan.
+
+Upgrade regressions seed legacy bridge submissions without notifications, reopen
+the same conversation, and reuse their message IDs with new text: the new task
+must get a distinct, notified submission, execute normally and cancel its own
+work. Another regression reopens an older prototype checkpoint and confirms
+abort uses its actual stored request ID rather than creating replacement input.
 
 Names and versions above describe the experiment, not a finalized public
 storage contract. #3 finalizes and documents that contract and adds killable

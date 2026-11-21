@@ -11,7 +11,7 @@ import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { ServerCallContext } from '@a2a-js/sdk/server';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux';
-import { createRegistry, defineExtension, defineTask, Harness, MemoryStorage } from '@earendil-works/pi-durable';
+import { createRegistry, defineExtension, defineTask, Harness, MemoryStorage, SubmissionSettled } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { A2AExtension, createA2AServer, openA2A } from 'pi-durable-a2a';
 import { A2ABinding, A2ATask, durableTaskStore } from '../src/a2a.js';
@@ -735,4 +735,110 @@ test('close joins an executor reader even after its send has stopped waiting', {
       running.bridge.store.load = original;
     }
   });
+});
+
+test('legacy bridge message IDs cannot adopt old submissions without task notifications', { timeout: 5000 }, async () => {
+  await fixture(async ({ faux, running, reopen }) => {
+    const seedLegacy = async (messageId) => {
+      faux.setResponses([fauxAssistantMessage('Legacy answer')]);
+      const submission = await running.conversation.submit({ type: 'input', content: 'Legacy text',
+        requestId: `a2a:${messageId}` }, context);
+      assert.equal((await submission.wait(context)).status, 'done');
+      await running.conversation.waitForIdle(context);
+      assert.equal((await submission.status(context)).notify, undefined);
+      return submission.id;
+    };
+    const legacyId = await seedLegacy('legacy-message');
+    const legacyCancelId = await seedLegacy('legacy-cancel');
+    running = await reopen();
+    faux.setResponses([fauxAssistantMessage('New answer for new text')]);
+    const task = await running.client.sendMessage(send('legacy-message', 'New text'));
+    assert.equal(task.status.state, TaskState.TASK_STATE_COMPLETED);
+    assert.match(JSON.stringify(task.status), /New answer for new text/);
+    const newSubmission = await running.harness.commit((tx) => tx.submissionByRequest(running.conversation.id,
+      `a2a.task:${task.id}`), context);
+    assert.ok(newSubmission);
+    assert.notEqual(newSubmission.id, legacyId);
+    assert.equal(newSubmission.notify.taskId, Number(task.id));
+    assert.equal(newSubmission.notify.key, 'answer');
+    const duplicate = await running.client.sendMessage(send('legacy-message', 'New text'));
+    assert.equal(duplicate.id, task.id);
+
+    const gate = gatedResponse('New work must be canceled');
+    faux.setResponses([gate.response]);
+    try {
+      const pending = await running.client.sendMessage(send('legacy-cancel', 'Different text', { returnImmediately: true }));
+      await gate.started;
+      const current = await running.harness.getTask(Number(pending.id), context);
+      const submission = await running.harness.submission(current.state.checkpoint.submissionId, context);
+      assert.equal((await submission.status(context)).requestId, `a2a.task:${pending.id}`);
+      const canceled = await running.client.cancelTask(CancelTaskRequest.fromJSON({ id: pending.id }));
+      await gate.aborted;
+      assert.equal(canceled.status.state, TaskState.TASK_STATE_CANCELED);
+      assert.equal((await submission.status(context)).reason, 'aborted');
+      const legacy = await running.harness.submission(legacyCancelId, context);
+      assert.equal((await legacy.status(context)).status, 'done');
+    } finally { gate.release(); }
+  });
+});
+
+test('cancellation reacquires the stored submission for older prototype checkpoints', { timeout: 5000 }, async () => {
+  await fixture(async ({ faux, running, reopen }) => {
+    const original = gatedResponse('Interrupted prototype');
+    const recovered = gatedResponse('Recovered prototype');
+    const legacyTask = defineTask({ ...A2ATask.definition, phases: { ...A2ATask.definition.phases,
+      async submit(task, runtime, ctx) {
+        const conversation = await runtime.conversation(runtime.conversationId, ctx);
+        await runtime.commit(async (tx) => {
+          const submissionId = await conversation.submit(tx, { type: 'input', content: task.input.text,
+            requestId: `a2a:${task.input.messageId}`, whenBusy: 'reject',
+            notify: { taskId: task.id, key: 'answer' } });
+          return { status: 'sleeping', signals: [SubmissionSettled.key('answer')],
+            checkpoint: { phase: 'answer', submissionId } };
+        }, ctx);
+      },
+    } });
+    running.registry.install(defineExtension({ name: 'a2a', tasks: [legacyTask] }));
+    faux.setResponses([original.response]);
+    try {
+      const pending = await running.client.sendMessage(send('prototype-message', 'Prototype text', { returnImmediately: true }));
+      await original.started;
+      const record = await running.harness.getTask(Number(pending.id), context);
+      const submissionId = record.state.checkpoint.submissionId;
+      faux.setResponses([recovered.response]);
+      running = await reopen(); // The host now installs the current task definition.
+      await recovered.started;
+      const canceled = await running.client.cancelTask(CancelTaskRequest.fromJSON({ id: pending.id }));
+      await recovered.aborted;
+      assert.equal(canceled.status.state, TaskState.TASK_STATE_CANCELED);
+      const submission = await running.harness.submission(submissionId, context);
+      assert.equal((await submission.status(context)).requestId, 'a2a:prototype-message');
+      assert.equal((await submission.status(context)).reason, 'aborted');
+      const accidental = await running.harness.commit((tx) => tx.submissionByRequest(running.conversation.id,
+        `a2a.task:${pending.id}`), context);
+      assert.equal(accidental, undefined, 'cancel must not create a replacement submission');
+    } finally { original.release(); recovered.release(); }
+  });
+});
+
+test('zero-match listing stops after the batched count pass', async () => {
+  let scans = 0;
+  const count = 10_000;
+  const record = { id: 1, conversationId: 1, endedAt: 2000,
+    state: { status: 'terminal', outcome: { status: 'completed' } },
+    get input() { throw new Error('No snapshot should be built'); },
+  };
+  const harness = { commit: async (change) => change({
+    async scanTasks(_query, limit, cursor) {
+      scans += 1;
+      assert.equal(limit, 100, 'zero matches must not trigger per-record pagination');
+      const offset = cursor?.offset ?? 0;
+      const next = Math.min(count, offset + limit);
+      return { items: Array(next - offset).fill(record), ...(next < count ? { next: { offset: next } } : {}) };
+    },
+  }) };
+  const store = durableTaskStore(harness, { id: 1 });
+  const page = await store.list({ pageSize: 1, status: TaskState.TASK_STATE_WORKING });
+  assert.deepEqual(page, { tasks: [], nextPageToken: '', pageSize: 1, totalSize: 0 });
+  assert.equal(scans, count / 100);
 });
