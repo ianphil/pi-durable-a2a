@@ -102,4 +102,4 @@ Run only one agent process against this store. All foreground input must come
 through A2A; do not add independent host submissions or automatic follow-up runs.
 Cancellation is conversation-wide in the targeted Durable version. This example
 is loopback-only, not a TLS server or production deployment. See the
-[full semantics](../README.md#semantics) and [storage contract](storage-contract.md).
+[full semantics](../README.md#semantics) and [stored format](../README.md#stored-format).
