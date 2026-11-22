@@ -1,59 +1,60 @@
-# A small persistent agent
+# A small persistent agent and client
 
-[`agent.js`](agent.js) is a complete host: one OpenAI provider, one SQLite-backed
+[`agent.js`](agent.js) uses Pi's configured model runtime, one SQLite-backed
 Durable conversation, native A2A on loopback, and ordered shutdown. No tools,
-gateway registration or deployment machinery.
+custom model integration, gateway registration or deployment machinery.
+[`client.js`](client.js) calls it with the official A2A SDK.
 
-## Run
+## Run the agent
 
 From the repository root, with Node 22.19 or newer:
 
 ```sh
 npm ci --ignore-scripts
-export OPENAI_API_KEY='<your API key>'
-export MODEL_ID='gpt-4o-mini'
+export PI_PROVIDER='<your configured Pi provider>'
+export PI_MODEL='<a model on that provider>'
 export A2A_TOKEN="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))')"
 node examples/agent.js
 ```
 
-Use a model in the provider's catalog that your account can access. Requests make
-real, potentially billable model calls. The provider reads its key from the
-environment; no key is put in the conversation. Keep the same listener token if
-you want existing callers to reconnect after a restart.
+Configure/authenticate the provider in Pi first, using `/login` or Pi's
+`models.json` for a compatible endpoint. `ModelRuntime` uses that configuration
+and credentials, just as Pi does. Requests make real, potentially billable model
+calls. Keys are not put in the conversation. The script refreshes its model and
+instructions on each start.
 
-## Send a message
+The default port is 8766; set `A2A_PORT` to use another. Keep the same listener
+token so existing callers can reconnect after a restart.
 
-In another terminal, set `A2A_TOKEN` to the same listener token, then:
+## Call it
+
+In another terminal, set `A2A_TOKEN` to the same listener token:
 
 ```sh
-curl -sS http://127.0.0.1:8766/a2a \
-  -H "Authorization: Bearer $A2A_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -H 'A2A-Version: 1.0' \
-  --data-binary @- <<'JSON'
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "SendMessage",
-  "params": {
-    "message": {
-      "messageId": "hello-1",
-      "role": "ROLE_USER",
-      "parts": [{ "text": "Remember that my name is Ada. Say hello." }]
-    }
-  }
-}
-JSON
+node examples/client.js
 ```
 
-The response is a task; answer text is in `result.task.status.message`.
-For a follow-up, use a new `messageId`, such as `hello-2`, and ask "What is my
-name?" All calls share the saved conversation; no new context is allocated.
+The client sends a random marker, retries the same message ID, asks a follow-up
+that recalls the marker, and gets the original completed task. It checks the
+responses and prints the saved task ID and answer. All calls share one
+conversation; no new context is allocated for the follow-up.
 
-Press Ctrl-C to stop. Restart the same command: conversation history and A2A
-records remain in `examples/.state/agent.sqlite`, and pending work resumes under
-Durable's retry policy. The script refreshes model/instructions on startup.
-State files are ignored by Git; they can contain private messages.
+For another port, set `A2A_URL` to the agent's base URL. Use the canonical URL:
+the client confines credentials to that origin and refuses redirects.
+
+## Restart and retrieve
+
+Press Ctrl-C in the agent terminal, then run it again. In the client terminal,
+use the ID printed by the first run:
+
+```sh
+TASK_ID='<saved task ID>' node examples/client.js
+```
+
+This gets the saved task without creating another model request. History and A2A
+records remain in `examples/.state/agent.sqlite`; pending work resumes under
+Durable's retry policy. State files are ignored by Git and can contain private
+messages. Run only one agent process against this store at a time.
 
 All foreground work must come through A2A. Do not add independent host input or
 automatic follow-up runs to this conversation: cancellation is conversation-wide.

@@ -29,8 +29,8 @@ npm install --ignore-scripts github:ianphil/pi-durable-a2a#v0.1.0 @earendil-work
 
 ## Serve a conversation
 
-For a complete, small host, see the [persistent agent example](examples/README.md).
-It uses one model provider, SQLite and native A2A, with no tools or gateway setup.
+For a small host and SDK client, see the [persistent agent example](examples/README.md).
+It uses Pi's model runtime, SQLite and native A2A, with no tools or gateway setup.
 
 **All foreground work in the served conversation must come through A2A.** Do not
 submit independent host input or automatic follow-up runs into it. Use separate

@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { test } from 'node:test';
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
@@ -37,6 +40,7 @@ async function listener(use, { mounted = false, compatibility = false } = {}) {
   try {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
+    a2a.card.supportedInterfaces[0].url = `${base}/a2a`;
     const rpc = (path, method, params, { version = '1.0', headers = {} } = {}) => fetch(`${base}${path}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
         ...(version ? { 'a2a-version': version } : {}), ...headers },
@@ -183,6 +187,23 @@ test('parameterised smoke exercises the SDK against real Durable execution', { t
       assert.deepEqual(checks, ['send/get', 'idempotency/conflicting-text', 'follow-up', 'paginated-list',
         'started', 'working/busy', 'polled-completed', 'canceled/stable-get']);
     } finally { complete.resolve(); cancel.resolve(); }
+  });
+});
+
+test('example client sends, retries, follows up and retrieves without another model call', { timeout: 10_000 }, async () => {
+  await listener(async ({ base, faux }) => {
+    const echoMarker = (transcript) => fauxAssistantMessage(JSON.stringify(transcript.messages).match(/example-[0-9a-f-]+/)[0]);
+    faux.setResponses([echoMarker, echoMarker]);
+    const run = promisify(execFile);
+    const file = fileURLToPath(new URL('../examples/client.js', import.meta.url));
+    const env = { ...process.env, A2A_URL: base, A2A_TOKEN: token, TASK_ID: '' };
+    const first = await run(process.execPath, [file], { env, timeout: 5000 });
+    assert.match(first.stdout, /Same-ID retry returned the original task/);
+    assert.match(first.stdout, /Follow-up recalled the marker/);
+    const id = first.stdout.match(/Saved task: (\d+)/)[1];
+    const retrieved = await run(process.execPath, [file], { env: { ...env, TASK_ID: id }, timeout: 5000 });
+    assert.equal(JSON.parse(retrieved.stdout).id, id);
+    assert.equal(faux.state.callCount, 2, 'retry and get do not invoke the model');
   });
 });
 
