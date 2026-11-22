@@ -12,9 +12,10 @@ message-ID bindings, results, cancellation and recovery all live in the host's
 Durable store. Backups need only that store. Stored identifiers, version-1 layouts
 and the migration policy are documented in the [storage contract](docs/storage-contract.md).
 
-Status: early. Targets A2A wire version `1.0`, `@a2a-js/sdk` 1.3.0 and Pi Durable
-1.6.0. The design comes from [Genesis Durable](https://github.com/ianphil/genesis-durable)'s
-A2A bridge.
+Status: early. [v0.1.0](https://github.com/ianphil/pi-durable-a2a/releases/tag/v0.1.0)
+is a GitHub-only source release; this package is not published to npm. Targets
+A2A wire version `1.0`, `@a2a-js/sdk` 1.3.0 and Pi Durable 1.6.0. The design comes
+from [Genesis Durable](https://github.com/ianphil/genesis-durable)'s A2A bridge.
 
 ## Install
 
@@ -23,7 +24,7 @@ package has no separate SQLite dependency or A2A database migration command.
 The host chooses its Durable storage backend.
 
 ```sh
-npm install --ignore-scripts github:ianphil/pi-durable-a2a @earendil-works/pi-durable@1.6.0 @earendil-works/chord@1.6.0
+npm install --ignore-scripts github:ianphil/pi-durable-a2a#v0.1.0 @earendil-works/pi-durable@1.6.0 @earendil-works/chord@1.6.0
 ```
 
 ## Serve a conversation
@@ -260,7 +261,8 @@ prior clean harness shutdown. Model recovery follows the configured retry policy
 these tests permit one retry, not exactly-once model execution. HTTP tests cover
 native-only serving, mounting beside host routes, and explicitly enabled LiteLLM
 get/list/cancel forwarding, including authentication and body limits. LiteLLM
-registration uses a local stand-in. They need no model credentials or network access.
+registration uses a local stand-in. Tests use local HTTP listeners but need no
+model credentials or external network access.
 
 ### Read-only live SDK smoke
 
