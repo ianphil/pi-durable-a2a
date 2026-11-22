@@ -7,8 +7,9 @@ import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/provid
 import { createRegistry, Harness, MemoryStorage } from '@earendil-works/pi-durable';
 import { A2AExtension, createA2AHttpHandler, createA2AServer, openA2A } from 'pi-durable-a2a';
 import { liteLLMTaskHandler } from 'pi-durable-a2a/litellm';
-import { ClientFactory, JsonRpcTransportFactory } from '@a2a-js/sdk/client';
-import { runGatewaySmoke } from '../scripts/gateway-smoke.js';
+import { AgentCard, GetTaskRequest } from '@a2a-js/sdk';
+import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory } from '@a2a-js/sdk/client';
+import { createSmokeFetch, runGatewaySmoke } from '../scripts/gateway-smoke.js';
 
 const token = 'a'.repeat(40);
 
@@ -148,8 +149,11 @@ test('LiteLLM forwarding is opt-in and uses SDK task compatibility', { timeout: 
 
 test('parameterised smoke exercises the SDK against real Durable execution', { timeout: 5000 }, async () => {
   await listener(async ({ base, a2a, faux }) => {
-    const fetchImpl = (input, init) => fetch(input, { ...init,
-      headers: { ...init?.headers, authorization: `Bearer ${token}` } });
+    const fetchImpl = (input, init) => {
+      const headers = new Headers(init?.headers);
+      headers.set('authorization', `Bearer ${token}`);
+      return fetch(input, { ...init, headers });
+    };
     const client = await new ClientFactory({ transports: [new JsonRpcTransportFactory({ fetchImpl })] })
       .createFromAgentCard({ ...a2a.card,
         supportedInterfaces: a2a.card.supportedInterfaces.map((entry) => ({ ...entry, url: `${base}/a2a` })),
@@ -179,5 +183,57 @@ test('parameterised smoke exercises the SDK against real Durable execution', { t
       assert.deepEqual(checks, ['send/get', 'idempotency/conflicting-text', 'follow-up', 'paginated-list',
         'started', 'working/busy', 'polled-completed', 'canceled/stable-get']);
     } finally { complete.resolve(); cancel.resolve(); }
+  });
+});
+
+test('smoke fetch preserves headers and replaces authorization on its configured origin', async () => {
+  await listener(async ({ base, server }) => {
+    const fetchImpl = createSmokeFetch(base, token);
+    let customHeader;
+    server.on('request', (req) => { customHeader = req.headers['x-smoke']; });
+    const headers = { 'content-type': 'application/json', 'a2a-version': '1.0', 'x-smoke': 'kept',
+      authorization: 'Bearer stale' };
+    const request = { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'GetTask', params: { id: '1' } }) };
+    for (const value of [headers, new Headers(headers), Object.entries(headers)]) {
+      const response = await fetchImpl(new URL(`${base}/a2a`), { ...request, headers: value });
+      assert.equal(response.status, 200, 'authentication and content type must survive');
+      assert.ok((await response.json()).error, 'unknown task is handled by the SDK');
+      assert.equal(customHeader, 'kept');
+    }
+    const response = await fetchImpl(new Request(`${base}/a2a`, { ...request, headers }));
+    assert.equal(response.status, 200, 'Request headers are inherited when init has none');
+    await response.json();
+    assert.equal(customHeader, 'kept');
+  });
+});
+
+test('smoke refuses foreign card endpoints and redirects before contacting their target', async (t) => {
+  await listener(async ({ base, a2a, server }) => {
+    let targetRequests = 0;
+    server.on('request', () => { targetRequests++; });
+    for (const redirect of [false, true]) await t.test(redirect ? 'redirect' : 'advertised endpoint', async () => {
+      let discoveryAuthorization;
+      const discovery = createServer((req, res) => {
+        discoveryAuthorization = req.headers.authorization;
+        if (redirect) { res.writeHead(302, { location: `${base}/.well-known/agent-card.json` }); res.end(); return; }
+        const card = { ...a2a.card, supportedInterfaces: a2a.card.supportedInterfaces.map((entry) => ({ ...entry, url: `${base}/a2a` })) };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(AgentCard.toJSON(card)));
+      });
+      try {
+        await new Promise((resolve) => discovery.listen(0, '127.0.0.1', resolve));
+        const url = `http://127.0.0.1:${discovery.address().port}`;
+        const fetchImpl = createSmokeFetch(url, token);
+        const factory = new ClientFactory({ transports: [new JsonRpcTransportFactory({ fetchImpl })],
+          cardResolver: new DefaultAgentCardResolver({ fetchImpl }) });
+        if (redirect) await assert.rejects(factory.createFromUrl(url), /redirects.*canonical A2A URL/i);
+        else {
+          const client = await factory.createFromUrl(url);
+          await assert.rejects(client.getTask(GetTaskRequest.fromJSON({ id: '1' })), /configured A2A origin/);
+        }
+        assert.equal(discoveryAuthorization, `Bearer ${token}`);
+        assert.equal(targetRequests, 0, 'no foreign request, credential-bearing or otherwise');
+      } finally { discovery.close(); discovery.closeAllConnections(); }
+    });
   });
 });

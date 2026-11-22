@@ -271,6 +271,11 @@ export A2A_SLOW_PROMPT='<slow read-only request appropriate for this agent>'
 node scripts/gateway-smoke.js
 ```
 
+The key is sent only to the configured URL's origin (scheme, host and port).
+An Agent Card advertising another origin is refused before contacting that
+endpoint. HTTP redirects are rejected; supply the canonical agent URL rather
+than a redirecting alias.
+
 The official SDK performs discovery and all task operations. The script checks
 send/get, message-ID retries and conflicting text, a follow-up that recalls a
 random marker, paginated list, start/working/completion, busy rejection and

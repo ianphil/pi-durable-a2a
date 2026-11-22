@@ -108,15 +108,29 @@ export async function runGatewaySmoke(client, {
   }
 }
 
+/** Keep the operator's key on the configured origin, including SDK card endpoints. */
+export function createSmokeFetch(url, token) {
+  const origin = new URL(url).origin;
+  return async (input, init) => {
+    const target = input instanceof Request ? input.url : input;
+    if (new URL(target).origin !== origin) throw new Error('Smoke requests must stay on the configured A2A origin');
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    headers.set('Authorization', `Bearer ${token}`);
+    // Redirects happen inside fetch, outside the origin check above. Do not follow.
+    const response = await fetch(input, { ...init, headers, redirect: 'manual' });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      throw new Error('Smoke redirects are unsupported; use the canonical A2A URL');
+    }
+    return response;
+  };
+}
+
 async function main() {
   const { A2A_URL: url, A2A_TOKEN_FILE: tokenFile, A2A_SLOW_PROMPT: slowPrompt } = process.env;
   assert.ok(url && tokenFile && slowPrompt, 'Set A2A_URL, A2A_TOKEN_FILE and A2A_SLOW_PROMPT');
   const token = (await readFile(tokenFile, 'utf8')).trim();
-  const fetchImpl = (input, init) => {
-    const headers = new Headers(init?.headers);
-    headers.set('Authorization', `Bearer ${token}`);
-    return fetch(input, { ...init, headers });
-  };
+  const fetchImpl = createSmokeFetch(url, token);
   const client = await new ClientFactory({
     transports: [new JsonRpcTransportFactory({ fetchImpl })],
     cardResolver: new DefaultAgentCardResolver({ fetchImpl }),
