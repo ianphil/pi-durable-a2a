@@ -10,7 +10,7 @@ conversation and parks until the submission settles. The SDK task store is a
 read-only translation of Durable records, not a second copy. Task records,
 message-ID bindings, results, cancellation and recovery all live in the host's
 Durable store. Backups need only that store. Stored identifiers, version-1 layouts
-and the migration policy are documented in the [storage contract](docs/storage-contract.md).
+and the migration policy are documented in [Stored format](#stored-format).
 
 Status: early. [v0.1.0](https://github.com/ianphil/pi-durable-a2a/releases/tag/v0.1.0)
 is a GitHub-only source release; this package is not published to npm. Targets
@@ -29,16 +29,17 @@ npm install --ignore-scripts github:ianphil/pi-durable-a2a#v0.1.0 @earendil-work
 
 ## Serve a conversation
 
-For a small host and SDK client, see the [persistent agent example](examples/README.md).
-It uses Pi's model runtime, SQLite and native A2A, with no tools or gateway setup.
+Start with the [quickstart](docs/quickstart.md) to run
+[`examples/agent.js`](examples/agent.js) and [`examples/client.js`](examples/client.js),
+then restart and retrieve a saved task. They use Pi's model runtime, SQLite and
+native A2A, with no tools or gateway setup.
 
 **All foreground work in the served conversation must come through A2A.** Do not
 submit independent host input or automatic follow-up runs into it. Use separate
 conversations for those inputs. Durable 1.6.0 only offers conversation-wide abort
 for placed submissions: canceling A2A work can otherwise stop a newer, unrelated
 host run. Outcome reporting preserves an answer or failure that won the race,
-but that does not make abort submission-scoped. See the
-[cancellation findings](docs/durable-task-prototype.md#cancellation-decision-still-open).
+but that does not make abort submission-scoped.
 
 Install the extension **before opening/resuming the harness**, on every restart:
 
@@ -162,6 +163,38 @@ package does not duplicate those adapters or require Express.
 The bearer token authenticates the listener, not individual callers. HTTP is
 unencrypted: use it only on a private network such as a tailnet.
 
+## Stored format
+
+These version-1 names and values are compatibility contracts in Durable:
+
+| Name | Stored value |
+| --- | --- |
+| `a2a.task` | Background task input: `{ messageId, text, hash, acceptedAt }` |
+| `a2a.message` | Conversation document family keyed by exact message ID: `{ taskId, hash }` |
+| `a2a.admission` | Conversation document: `{ active }`, the last admitted task ID |
+
+Text parts are joined with `\n`; `hash` is their UTF-8 SHA-256 digest and
+`acceptedAt` is wall-clock milliseconds. The task and message binding are created
+atomically. Both document kinds use `history: 'latest'` and `fork: 'initial'`;
+forks start with fresh A2A bindings. An obsolete admission `count` is ignored,
+and a terminal `active` pointer does not mean the conversation is busy.
+
+The task starts at `{ phase: 'submit' }`, then commits submission admission and
+parking together at `{ phase: 'answer', submissionId }`, waiting on
+`SubmissionSettled.key('answer')`. New submission request IDs are
+`a2a.task:<task ID>`; cancellation uses the committed submission's actual request
+ID, including older `a2a:<message ID>` requests. Result-message IDs are
+`<task ID>:answer`. Durable IDs are numeric internally and canonical decimal
+strings for A2A task/context IDs. Outcomes are the completed answer string,
+failure or abort; arbitrary failure diagnostics stay private.
+
+The current view supports task version `1` only and refuses unknown/future
+versions without interpreting or rewriting them. Incompatible changes must keep
+stored names stable, increment the definition version and use Durable's migration
+callbacks, with tests against old records. Preserve task IDs, bindings, outcomes
+and submission associations, including terminal records. Back up before upgrading;
+downgrade support is not promised—restore a compatible backup instead.
+
 ## Upgrading from the separate-database bridge
 
 `openA2A` now requires `{ harness, conversation, card }` and a host-installed
@@ -174,8 +207,8 @@ uses the request ID in the task's committed submission record.
 
 Stop the old listener and settle pending work before upgrading. Archive its A2A
 store if you need its task history. New admissions and all new task state use
-only Durable. Version-1 identifiers and upgrade policy are in the storage
-contract. This is an early API; the former separate-database API is not preserved.
+only Durable. Version-1 identifiers and upgrade policy are in [Stored format](#stored-format).
+This is an early API; the former separate-database API is not preserved.
 
 ## Publish through LiteLLM
 
