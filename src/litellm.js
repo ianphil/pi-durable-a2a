@@ -38,7 +38,8 @@ export function liteLLMRegistry(config) {
   const request = async (path, method = 'GET', body) => {
     const key = (await readFile(config.adminKeyFile, 'utf8')).trim();
     const response = await fetch(new URL(path, url), {
-      method, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20_000),
+      // Registration sends the listener token in the body; a redirect could deliver it elsewhere.
+      method, body: body === undefined ? undefined : JSON.stringify(body), redirect: 'error', signal: AbortSignal.timeout(20_000),
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
     });
     if (response.status === 404 && method === 'DELETE') return null;
@@ -133,8 +134,9 @@ export function liteLLMRegistry(config) {
       const candidates = rows.filter((row) => row.agent_name === agent.name || (saved && row.agent_id === saved.id));
       if (candidates.some((row) => !owns(row, agent))) throw new Error('gateway_ownership_conflict');
       for (const row of candidates) {
-        await request(`/v1/agents/${encodeURIComponent(row.agent_id)}`, 'DELETE');
+        // Revoke first: once the row is gone, a retry without `saved` can no longer find this grant.
         await grant(row.agent_id, true);
+        await request(`/v1/agents/${encodeURIComponent(row.agent_id)}`, 'DELETE');
       }
       if (!candidates.length && saved) await grant(saved.id, true);
     },
