@@ -11,13 +11,14 @@ Use Pi's `/login` and `/model`, or its `models.json` for a compatible endpoint.
 The agent uses Pi's `ModelRuntime`; it does not need a separate model client.
 Model requests may be billable. The shell commands below use Bash.
 
-Use a current repository checkout—the examples were added after the initial
-`v0.1.0` release:
+Clone the repository and build the package; the example agent imports it by
+name, as a host does:
 
 ```sh
 git clone https://github.com/ianphil/pi-durable-a2a.git
 cd pi-durable-a2a
 npm ci --ignore-scripts
+npm run build
 ```
 
 If you already have the checkout, work from its root. Both terminals below must
@@ -41,11 +42,11 @@ if ! test -f examples/.state/listener-token; then
   node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))' > examples/.state/listener-token
 fi
 export A2A_TOKEN="$(<examples/.state/listener-token)"
-node examples/agent.js
+npm run agent
 ```
 
 The agent listens at `http://127.0.0.1:8766/a2a`. Leave it running.
-[`agent.js`](../examples/agent.js) installs `A2AExtension`, opens SQLite,
+[`agent.ts`](../examples/agent.ts) installs `A2AExtension`, opens SQLite,
 configures one conversation and serves native A2A. Model credentials stay in
 Pi's configuration, not in that conversation.
 
@@ -55,10 +56,10 @@ In a second terminal, from the same repository root:
 
 ```sh
 export A2A_TOKEN="$(<examples/.state/listener-token)"
-node examples/client.js
+npm run client
 ```
 
-[`client.js`](../examples/client.js) checks four things:
+[`client.ts`](../examples/client.ts) checks four things:
 
 1. Send a random marker and receive it in the answer.
 2. Retry the same message ID and text; receive the same task, not another run.
@@ -70,16 +71,16 @@ It prints `Saved task: <id>` and the task JSON. Keep that ID for the next step.
 ## 4. Restart and retrieve
 
 Press Ctrl-C in the agent terminal. Its shutdown closes HTTP, then the A2A
-adapter and Durable harness. Start it again in that same terminal:
+handler and the Durable Harness. Start it again in that same terminal:
 
 ```sh
-node examples/agent.js
+npm run agent
 ```
 
 In the client terminal, use your saved task ID:
 
 ```sh
-TASK_ID='<saved task ID>' node examples/client.js
+TASK_ID='<saved task ID>' npm run client
 ```
 
 This reads the original completed task without a new model request. The saved

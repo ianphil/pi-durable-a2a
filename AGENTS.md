@@ -33,6 +33,16 @@ mechanism?
 - Keep existing boundaries while they make the code readable; don't add layers
   merely to enforce separation.
 
+## TypeScript
+
+- Strict TypeScript with erasable syntax only, so Node runs files directly; no
+  `enum`, `namespace` or parameter properties. Relative imports use `.ts`.
+- Tagged unions for states and results; switch on the tag, not on `in`.
+- Runtime checks only at trust boundaries: wire input, stored records and gateway
+  responses. Say which boundary a check serves. Casts only where TypeScript cannot
+  express an invariant, each with a short reason.
+- Run `npm run check` (Biome and `tsc`) and `npm test` before reporting.
+
 ## Project and architecture
 
 Read [README.md](README.md) and [docs/](docs/) for supported behavior and public
@@ -46,12 +56,13 @@ only when you can name a caller-visible behavior that neither provides alone—f
 example, retrying a message after a lost response must return the same Durable
 task.
 
-- **The A2A SDK owns protocol handling**, request validation and response semantics.
+- **The A2A SDK owns the wire**: protocol types, JSON-RPC transport and error
+  mapping. Use its public interfaces only; don't subclass its internals.
 - **Pi Durable owns execution and state**: persistence, scheduling, cancellation,
-  recovery and conversation history. An A2A task is a Durable task; the SDK store
-  is a translated view, not another persisted copy.
-- **This library owns the mapping**: atomic message-ID bindings, record translation
-  and host integration. **The host owns policy and resources**: authentication,
+  recovery and conversation history. An A2A task is a Durable task; A2A task
+  snapshots are translated views, not another persisted copy.
+- **This library owns the mapping**: the SDK's request-handler interface on
+  Durable, atomic message-ID bindings, record translation and host integration. **The host owns policy and resources**: authentication,
   conversation selection, models, tools, storage and resource limits. Gateways
   such as LiteLLM are optional integrations.
 
@@ -65,8 +76,8 @@ SDK-specific adaptations should be narrow, justified and regression-tested.
 Treat stored names, schemas and request keys as compatibility contracts. Storage
 work means documenting versioning/migration and testing crashes—not building
 Durable's pruning or archiving. Don't add arbitrary lifetime task quotas as a
-retention policy, or describe hiding records as physical pruning. Keep later roadmap work out
-of the current change.
+retention policy, or describe hiding records as physical pruning. Keep later
+roadmap work out of the current change.
 
 ## Current cancellation constraint
 
@@ -80,7 +91,8 @@ Don't remove this restriction with a scheduler workaround.
 ## Testing and documentation
 
 - Use local scripted models and real Durable storage. Prefer explicit gates over
-  short timing windows. Run `npm ci --ignore-scripts` and `npm test`.
+  short timing windows. Run `npm ci --ignore-scripts`, `npm run check` and
+  `npm test`.
 - Keep the README, docs, examples and public contracts aligned.
 - This repository is public: fleet addresses, hostnames, credential paths,
   deployment commands and fleet-specific evidence belong in the private fleet
