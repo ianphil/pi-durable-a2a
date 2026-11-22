@@ -249,6 +249,9 @@ npm ci --ignore-scripts
 npm test
 ```
 
+GitHub Actions runs these commands on Node 22 and 24 for pull requests and
+pushes to `main`. CI does not publish packages or deploy services.
+
 The tests use one extension-enabled Durable harness fixture on SQLite and the
 official SDK client, including restart, concurrent admission, late cancellation
 and ordered shutdown. Storage tests kill further backend access during a model
