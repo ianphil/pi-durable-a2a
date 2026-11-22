@@ -274,7 +274,7 @@ npm run build   # dist/, as released
 Source, tests, examples and scripts are strict TypeScript using only erasable
 syntax, so Node runs the examples and scripts directly. Tests import the package
 by name from its source. GitHub Actions runs the check, tests and build on Node 22
-and 24 for pull requests and pushes to `main`. Pushing a `v*` tag that matches the
+and 24 for pull requests and pushes to `master`. Pushing a `v*` tag that matches the
 package version builds the tarball and attaches it to a GitHub release.
 
 The tests use real Durable storage on SQLite and the SDK client, with scripted
