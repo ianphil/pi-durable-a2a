@@ -19,9 +19,15 @@ part of this change." -- Ian Philpot
 
 ## Code readability
 
+When reviewing a change, ask: Can a reader find the guarantee, see what would
+break without it, and follow the normal path without learning an unrelated
+mechanism?
+
 - Put the main steps in the order they happen so the happy path reads directly.
 - Keep checks, limits and cleanup close to the actions they protect. Don't remove
   safeguards just to make code shorter.
+- Use comments to explain a non-obvious constraint or failure mode. If the code
+  already says what happens, don't repeat it.
 - Extract helpers when their names explain real steps or give tricky details a
   clear home. Don't add layers just to shorten functions or files.
 - Keep existing boundaries while they make the code readable; don't add layers
@@ -34,6 +40,11 @@ contracts before changing a feature.
 
 This is a thin Durable extension that maps A2A onto a host conversation, not a
 standalone server that happens to call Durable.
+
+Start with what the A2A SDK and Pi Durable already guarantee. Add bridge logic
+only when you can name a caller-visible behavior that neither provides alone—for
+example, retrying a message after a lost response must return the same Durable
+task.
 
 - **The A2A SDK owns protocol handling**, request validation and response semantics.
 - **Pi Durable owns execution and state**: persistence, scheduling, cancellation,
