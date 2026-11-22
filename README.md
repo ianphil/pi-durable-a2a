@@ -242,7 +242,9 @@ a model-callable tool or with the key inside the agent's reach.
 - Grants are read, modified and written, preserving other permissions. LiteLLM
   offers no atomic append: registrars updating the same team must run one at a
   time. The lock directory coordinates only callers that share it.
-- `withdraw` removes only records this agent owns.
+- `withdraw` removes only records this agent owns. It revokes the grant before
+  deleting the registration, so a failed withdrawal can be retried.
+- Gateway redirects are refused: supply the canonical gateway URL.
 
 ### LiteLLM task forwarding
 
